@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phantasma"
+version = "0.1.0"
+description = "Standard astronomy map preprocessing utilities"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "astropy",
+    "reproject",
+    "healpy",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["phantasma*"]
