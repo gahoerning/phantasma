@@ -13,6 +13,8 @@ dependencies = [
     "astropy",
     "reproject",
     "healpy",
+    "scipy",
+    "tqdm",
 ]
 
 [tool.setuptools.packages.find]
