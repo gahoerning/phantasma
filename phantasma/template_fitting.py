@@ -47,6 +47,81 @@ __all__ = [
 
 
 # ============================================================
+# Scientific rounding utility
+# ============================================================
+
+
+def _round_to_uncertainty(value, sigma, n_sig=2):
+    """
+    Round *value* and *sigma* so that *sigma* retains *n_sig* significant
+    figures.  The value is rounded to the same decimal position.
+
+    This follows the standard scientific convention for reporting
+    measurements with uncertainties.
+
+    Parameters
+    ----------
+    value : float
+        Central value.
+    sigma : float
+        Uncertainty.  Must be positive and finite.
+    n_sig : int
+        Number of significant figures to keep in *sigma* (default: 2).
+
+    Returns
+    -------
+    value_rounded : float
+    sigma_rounded : float
+    value_str : str
+    sigma_str : str
+    combined_str : str
+        Paper-ready string, e.g. ``"1.50 \u00b1 0.17"``.
+
+    Examples
+    --------
+    >>> _round_to_uncertainty(1.4991, 0.1676)
+    (1.5, 0.17, '1.50', '0.17', '1.50 \u00b1 0.17')
+    >>> _round_to_uncertainty(3.0002e4, 2.121e2)
+    (30000.0, 200.0, '3.000e+04', '2.0e+02', '3.000e+04 \u00b1 2.0e+02')
+    """
+    import math
+
+    # Fall back to generic formatting for edge cases
+    if not (np.isfinite(sigma) and sigma > 0 and np.isfinite(value)):
+        v_s = f"{value:.6g}"
+        s_s = f"{sigma:.6g}"
+        return value, sigma, v_s, s_s, f"{v_s} \u00b1 {s_s}"
+
+    # Power of 10 of the last significant digit we want to keep in sigma
+    mag = math.floor(math.log10(sigma))  # e.g. sigma=0.167 → mag=-1
+    last_pos = mag - n_sig + 1           # e.g. n_sig=2      → last_pos=-2
+
+    # Round both to that precision
+    scale = 10.0 ** last_pos
+    sigma_r = round(sigma / scale) * scale
+    value_r = round(value / scale) * scale
+
+    # Choose fixed vs scientific notation based on magnitude
+    use_fixed = (last_pos <= 0) and (-4 <= mag)
+
+    if use_fixed:
+        decimals = -last_pos
+        s_s = f"{sigma_r:.{decimals}f}"
+        v_s = f"{value_r:.{decimals}f}"
+    else:
+        # Scientific notation for very large / very small numbers
+        s_s = f"{sigma_r:.{n_sig - 1}e}"
+        if value_r != 0:
+            val_mag = math.floor(math.log10(abs(value_r)))
+            val_n_sig = val_mag - last_pos + 1
+            v_s = f"{value_r:.{max(val_n_sig - 1, 0)}e}"
+        else:
+            v_s = "0"
+
+    return value_r, sigma_r, v_s, s_s, f"{v_s} \u00b1 {s_s}"
+
+
+# ============================================================
 # Result dataclass
 # ============================================================
 
@@ -59,9 +134,16 @@ class TemplateFitResult:
     Attributes
     ----------
     coefficients : dict
-        Per-parameter summary: ``{name: {"value", "formal_error",
-        "bootstrap_mean", "bootstrap_error"}}``.
-        Bootstrap entries are ``None`` when the fit was run without bootstrap.
+        Per-parameter summary::
+
+            {name: {
+                "value",
+                "formal_error",
+                "bootstrap_mean",   # None if no bootstrap
+                "bootstrap_error",  # None if no bootstrap
+                "calib_error",      # calibration-only contribution
+                "total_error",      # sqrt(stat² + calib²)
+            }}
 
     beta : ndarray, shape (Npar,)
         Best-fit coefficient vector (physical templates first, then geometric).
@@ -70,17 +152,36 @@ class TemplateFitResult:
         Name of each element of ``beta``.
 
     beta_formal_error : ndarray, shape (Npar,)
-        Formal (analytic) 1-sigma uncertainties derived from the scaled
-        covariance matrix.
+        Formal (analytic) 1-sigma uncertainties from the scaled covariance
+        matrix.  Based on white-noise weights only.
 
     beta_bootstrap_mean : ndarray or None, shape (Npar,)
         Mean of bootstrap coefficient samples.
 
     beta_bootstrap_error : ndarray or None, shape (Npar,)
-        Standard deviation of bootstrap coefficient samples.
+        Standard deviation of bootstrap samples.  Captures the statistical
+        (white-noise) uncertainty only — calibration is NOT included here.
 
     beta_bootstrap_cov : ndarray or None, shape (Npar, Npar)
         Covariance matrix estimated from bootstrap samples.
+
+    beta_calib_error : ndarray, shape (Npar,)
+        Uncertainty contribution from globally-correlated calibration errors,
+        propagated analytically after the fit::
+
+            σ_calib(aᵢ)² = (aᵢ · f_data_cal)² + (aᵢ · f_template_cal_i)²
+
+        For geometric coefficients only the data-calibration term enters
+        (geometric templates carry no calibration error of their own).
+
+    beta_total_error : ndarray, shape (Npar,)
+        Total 1-sigma uncertainty — statistical and calibration added in
+        quadrature::
+
+            σ_total = sqrt(σ_stat² + σ_calib²)
+
+        where ``σ_stat`` is ``beta_bootstrap_error`` (bootstrap run) or
+        ``beta_formal_error`` (``template_fit``).
 
     model_map : ndarray, shape (ny, nx)
         Best-fit model map (NaN outside the valid mask).
@@ -89,7 +190,7 @@ class TemplateFitResult:
         Residual map: ``data_map - model_map``.
 
     sigma_eff_map : ndarray, shape (ny, nx)
-        Effective per-pixel uncertainty used in the last fit iteration.
+        Effective per-pixel white-noise uncertainty used in the last iteration.
 
     valid_mask : ndarray of bool, shape (ny, nx)
         ``True`` where pixels were included in the fit.
@@ -132,6 +233,8 @@ class TemplateFitResult:
     beta_bootstrap_mean: Optional[np.ndarray]
     beta_bootstrap_error: Optional[np.ndarray]
     beta_bootstrap_cov: Optional[np.ndarray]
+    beta_calib_error: np.ndarray
+    beta_total_error: np.ndarray
     model_map: np.ndarray
     residual_map: np.ndarray
     sigma_eff_map: np.ndarray
@@ -151,56 +254,128 @@ class TemplateFitResult:
     # Convenience methods
     # ------------------------------------------------------------------
 
-    def summary(self) -> str:
+    def summary(self, n_sig: int = 2) -> dict:
         """
-        Print and return a formatted summary of the fit results.
+        Print a paper-ready summary of the fit and return the rounded values.
 
-        Columns show the parameter name, best-fit value, formal 1-sigma
-        uncertainty, and bootstrap uncertainty (if available).
+        The uncertainty column used for rounding is always ``total_error``
+        (bootstrap + calibration in quadrature).  The central value is
+        rounded to the same decimal position as the rounded uncertainty.
+
+        Parameters
+        ----------
+        n_sig : int
+            Number of significant figures to keep in the uncertainty
+            (default: 2, standard in most astronomy journals).
 
         Returns
         -------
-        text : str
-            The formatted summary string.
+        out : dict with keys:
+
+            ``"text"``
+                The formatted summary string that was printed.
+
+            ``"rounded"``
+                Per-parameter dict::
+
+                    {name: {
+                        "value"           : float  (rounded),
+                        "total_error"     : float  (rounded),
+                        "value_str"       : str,
+                        "total_error_str" : str,
+                        "paper_str"       : str,   # e.g. "1.50 \u00b1 0.17"
+                    }}
+
+            ``"raw"``
+                Per-parameter dict with full-precision values::
+
+                    {name: {
+                        "value"       : float,
+                        "stat_error"  : float,   # bootstrap or formal
+                        "calib_error" : float,
+                        "total_error" : float,
+                    }}
         """
         has_boot = self.beta_bootstrap_error is not None
 
-        lines = []
-        lines.append("=" * 70)
-        lines.append("Template Fit Summary")
-        lines.append("=" * 70)
-
-        header = f"{'Parameter':<24} {'Value':>13} {'Formal σ':>13}"
-        if has_boot:
-            header += f" {'Bootstrap σ':>13}"
-        lines.append(header)
-        lines.append("-" * 70)
+        # ---- Build rounded / raw representations per parameter ----
+        rounded = {}
+        raw = {}
 
         for name, info in self.coefficients.items():
-            row = (
-                f"{name:<24} {info['value']:>13.5g} {info['formal_error']:>13.5g}"
+            stat_err = (
+                info["bootstrap_error"]
+                if (has_boot and info["bootstrap_error"] is not None)
+                else info["formal_error"]
             )
-            if has_boot and info["bootstrap_error"] is not None:
-                row += f" {info['bootstrap_error']:>13.5g}"
+            v_r, s_r, v_s, s_s, paper = _round_to_uncertainty(
+                info["value"], info["total_error"], n_sig=n_sig
+            )
+            rounded[name] = {
+                "value": v_r,
+                "total_error": s_r,
+                "value_str": v_s,
+                "total_error_str": s_s,
+                "paper_str": paper,
+            }
+            raw[name] = {
+                "value": info["value"],
+                "stat_error": stat_err,
+                "calib_error": info["calib_error"],
+                "total_error": info["total_error"],
+            }
+
+        # ---- Format printed table ----
+        col_w = 88
+        paper_col = 28
+        stat_label = "Stat \u03c3" if has_boot else "Formal \u03c3"
+
+        lines = []
+        lines.append("=" * col_w)
+        lines.append("Template Fit Summary")
+        lines.append("=" * col_w)
+        lines.append(
+            f"{'Parameter':<24} {'Paper value':<{paper_col}}"
+            f" {stat_label:>13} {'Calib \u03c3':>13} {'Total \u03c3':>13}"
+        )
+        lines.append("-" * col_w)
+
+        for name, info in self.coefficients.items():
+            stat_err = (
+                info["bootstrap_error"]
+                if (has_boot and info["bootstrap_error"] is not None)
+                else info["formal_error"]
+            )
+            row = (
+                f"{name:<24}"
+                f" {rounded[name]['paper_str']:<{paper_col}}"
+                f" {stat_err:>13.3g}"
+                f" {info['calib_error']:>13.3g}"
+                f" {info['total_error']:>13.3g}"
+            )
             lines.append(row)
 
-        lines.append("-" * 70)
-        lines.append(f"χ²_red    = {self.chi2_red:.4f}")
+        lines.append("-" * col_w)
+        lines.append(f"\u03c7\u00b2_red    = {self.chi2_red:.4f}  (white-noise weights only)")
         lines.append(f"ndof      = {self.ndof}")
         lines.append(f"n_pix     = {self.n_pix}")
         lines.append(f"n_iter    = {self.n_iter_done}")
         lines.append(
-            f"converged = {'yes' if self.converged else 'NO  ← consider increasing n_iter'}"
+            f"converged = {'yes' if self.converged else 'NO  \u2190 consider increasing n_iter'}"
         )
         if has_boot and self.bootstrap_converged is not None:
             n_boot_conv = int(np.sum(self.bootstrap_converged))
             n_boot = len(self.bootstrap_converged)
             lines.append(f"bootstrap convergence: {n_boot_conv}/{n_boot}")
-        lines.append("=" * 70)
+        lines.append(
+            f"rounding: {n_sig} significant figure(s) in the uncertainty  "
+            f"[use result.summary(n_sig=N) to change]"
+        )
+        lines.append("=" * col_w)
 
         text = "\n".join(lines)
         print(text)
-        return text
+        return {"text": text, "rounded": rounded, "raw": raw}
 
     def component_maps(self, template_maps: np.ndarray) -> np.ndarray:
         """
@@ -624,73 +799,109 @@ def _weighted_linear_fit(y, X, sigma):
     }
 
 
-def _compute_effective_sigmas(
-    data_vec,
-    template_vecs,
-    data_rms_vec,
-    template_rms_vecs,
-    data_calib_frac,
-    template_calib_frac,
-):
+def _compute_white_noise_sigmas(data_rms_vec, template_rms_vecs):
     """
-    Compute effective per-pixel variances for data and physical templates.
+    Compute per-pixel white-noise variances for data and physical templates.
 
-    Calibration uncertainty is added in quadrature with white-noise RMS:
-
-        ``σ²_data_eff(p) = σ²_data_white(p) + (f_data_cal · data(p))²``
-
-        ``σ²_template_eff_i(p) = σ²_template_white_i(p)
-                                  + (f_template_cal_i · template_i(p))²``
+    These are the *uncorrelated* noise contributions that enter the WLS
+    weights and the bootstrap.  Globally-correlated calibration errors are
+    handled separately by :func:`_compute_calib_uncertainty_on_beta`.
 
     Parameters
     ----------
-    data_vec : ndarray, shape (Npix,)
-    template_vecs : ndarray, shape (Npix, Ntemp)
     data_rms_vec : ndarray, shape (Npix,)
+        Per-pixel white-noise RMS of the target map.
     template_rms_vecs : ndarray, shape (Npix, Ntemp)
-    data_calib_frac : float
-    template_calib_frac : ndarray, shape (Ntemp,)
+        Per-pixel white-noise RMS of each physical template.
 
     Returns
     -------
-    sigma2_data_eff : ndarray, shape (Npix,)
-    sigma2_template_eff : ndarray, shape (Npix, Ntemp)
+    sigma2_data_white : ndarray, shape (Npix,)
+    sigma2_template_white : ndarray, shape (Npix, Ntemp)
     """
-    sigma2_data_eff = data_rms_vec**2 + (data_calib_frac * data_vec) ** 2
-
-    sigma2_template_eff = np.zeros_like(template_vecs, dtype=float)
-    ntemp = template_vecs.shape[1]
-
-    for i in range(ntemp):
-        sigma2_template_eff[:, i] = (
-            template_rms_vecs[:, i] ** 2
-            + (template_calib_frac[i] * template_vecs[:, i]) ** 2
-        )
-
-    return sigma2_data_eff, sigma2_template_eff
+    sigma2_data_white = data_rms_vec ** 2
+    sigma2_template_white = template_rms_vecs ** 2
+    return sigma2_data_white, sigma2_template_white
 
 
-def _run_iterative_fit(y, X, sigma2_data_eff, sigma2_template_eff, ntemp, n_iter, tol):
+def _compute_calib_uncertainty_on_beta(
+    beta, ntemp, data_calib_frac, template_calib_frac
+):
+    """
+    Compute the calibration contribution to the uncertainty on each coefficient.
+
+    Calibration errors are *globally correlated* across all pixels — the
+    entire map (or template) is scaled by the same unknown factor.  They
+    therefore cannot be captured by pixel resampling (bootstrap) and must
+    be propagated analytically.
+
+    For a data-calibration error ``ε_data`` (σ = f_data_cal):
+
+        All fitted coefficients shift by ``β · ε_data``:
+
+            ``δβᵢ = βᵢ · ε_data``   →   ``σ_calib_data(βᵢ)² = (βᵢ · f_data_cal)²``
+
+    For a template-calibration error ``εᵢ`` on template *i* (σ = f_template_cal_i):
+
+        Only the *i*-th physical coefficient shifts:
+
+            ``δaᵢ = -aᵢ · εᵢ``   →   ``σ_calib_template(aᵢ)² = (aᵢ · f_template_cal_i)²``
+
+    Both contributions are added in quadrature.  Geometric template
+    coefficients (indices ≥ ntemp) are only affected by the data calibration.
+
+    Parameters
+    ----------
+    beta : ndarray, shape (Npar,)
+        Best-fit coefficient vector.
+    ntemp : int
+        Number of physical templates (``beta[:ntemp]`` are physical coefficients).
+    data_calib_frac : float
+        Fractional calibration uncertainty of the target map.
+    template_calib_frac : ndarray, shape (Ntemp,)
+        Fractional calibration uncertainties of the physical templates.
+
+    Returns
+    -------
+    sigma_calib : ndarray, shape (Npar,)
+        1-sigma calibration uncertainty on each coefficient.
+    """
+    sigma2_calib = (beta * data_calib_frac) ** 2  # data cal affects all params
+
+    for i in range(ntemp):                         # template cal only for physical
+        sigma2_calib[i] += (beta[i] * template_calib_frac[i]) ** 2
+
+    return np.sqrt(sigma2_calib)
+
+
+def _run_iterative_fit(
+    y, X, sigma2_data_white, sigma2_template_white, ntemp, n_iter, tol
+):
     """
     Run the iterative weighted fit until convergence.
 
-    Iteratively updates the total per-pixel variance:
+    Uses *white-noise-only* variances in the per-pixel weights::
 
-        ``σ²_tot(p) = σ²_data_eff(p) + Σ_i a_i² · σ²_template_eff_i(p)``
+        σ²_tot(p) = σ²_data_white(p) + Σᵢ aᵢ² · σ²_template_white_i(p)
 
-    and re-fits until the relative change in all coefficients is below *tol*.
+    Calibration errors are globally correlated and are therefore NOT included
+    here; they are propagated analytically by the caller via
+    :func:`_compute_calib_uncertainty_on_beta`.
+
+    The iteration is needed because the template white-noise contribution
+    depends on the fitted amplitudes ``aᵢ``, which change each iteration.
 
     Returns
     -------
     fit : dict
-        Last ``_weighted_linear_fit`` result.
+        Last :func:`_weighted_linear_fit` result.
     sigma : ndarray, shape (Npix,)
-        Final effective sigma vector.
+        Final effective white-noise sigma vector.
     n_iter_done : int
     converged : bool
     """
-    # Initial fit using only data noise
-    sigma = np.sqrt(sigma2_data_eff)
+    # Seed fit using data white noise only
+    sigma = np.sqrt(sigma2_data_white)
     fit = _weighted_linear_fit(y, X, sigma)
     beta_old = fit["beta"].copy()
 
@@ -702,9 +913,9 @@ def _run_iterative_fit(y, X, sigma2_data_eff, sigma2_template_eff, ntemp, n_iter
 
         a_templates = beta_old[:ntemp]
 
-        sigma2_tot = sigma2_data_eff.copy()
+        sigma2_tot = sigma2_data_white.copy()
         for i in range(ntemp):
-            sigma2_tot += (a_templates[i] ** 2) * sigma2_template_eff[:, i]
+            sigma2_tot += (a_templates[i] ** 2) * sigma2_template_white[:, i]
 
         sigma = np.sqrt(sigma2_tot)
         fit = _weighted_linear_fit(y, X, sigma)
@@ -885,19 +1096,15 @@ def template_fit(
     else:
         X = template_vecs
 
-    # ---- Effective variances ----
-    sigma2_data_eff, sigma2_template_eff = _compute_effective_sigmas(
-        data_vec=y,
-        template_vecs=template_vecs,
+    # ---- White-noise variances (used in the fit and bootstrap) ----
+    sigma2_data_white, sigma2_template_white = _compute_white_noise_sigmas(
         data_rms_vec=data_rms_vec,
         template_rms_vecs=template_rms_vecs,
-        data_calib_frac=data_calib_frac,
-        template_calib_frac=template_calib_frac,
     )
 
     # ---- Iterative fit ----
     fit, sigma_best, n_iter_done, converged = _run_iterative_fit(
-        y, X, sigma2_data_eff, sigma2_template_eff, ntemp, n_iter, tol
+        y, X, sigma2_data_white, sigma2_template_white, ntemp, n_iter, tol
     )
 
     if not converged:
@@ -919,6 +1126,12 @@ def template_fit(
     residual_map[valid] = y - model_map[valid]
     sigma_eff_map[valid] = sigma_best
 
+    # ---- Calibration uncertainty (analytic, globally correlated) ----
+    beta_calib_error = _compute_calib_uncertainty_on_beta(
+        beta_best, ntemp, data_calib_frac, template_calib_frac
+    )
+    beta_total_error = np.sqrt(fit["formal_error"] ** 2 + beta_calib_error ** 2)
+
     # ---- Organise output ----
     coefficients = {
         name: {
@@ -926,6 +1139,8 @@ def template_fit(
             "formal_error": fit["formal_error"][i],
             "bootstrap_mean": None,
             "bootstrap_error": None,
+            "calib_error": beta_calib_error[i],
+            "total_error": beta_total_error[i],
         }
         for i, name in enumerate(beta_names)
     }
@@ -938,6 +1153,8 @@ def template_fit(
         beta_bootstrap_mean=None,
         beta_bootstrap_error=None,
         beta_bootstrap_cov=None,
+        beta_calib_error=beta_calib_error,
+        beta_total_error=beta_total_error,
         model_map=model_map,
         residual_map=residual_map,
         sigma_eff_map=sigma_eff_map,
@@ -980,19 +1197,22 @@ def template_fit_bootstrap(
 
         ``data_map = Σ_i a_i template_i + Σ_j b_j geom_j + residual``
 
-    The total per-pixel uncertainty is iteratively updated as:
+    **Noise model for the iterative fit and bootstrap:**
 
-        ``σ²_tot(p) = σ²_data_eff(p) + Σ_i a_i² · σ²_template_eff_i(p)``
+    Only *uncorrelated* (white) noise enters the per-pixel weights::
 
-    where:
+        σ²_tot(p) = σ²_data_rms(p) + Σᵢ aᵢ² · σ²_template_rms_i(p)
 
-        ``σ²_data_eff(p) = σ²_data_white(p) + (f_data_cal · data(p))²``
+    **Calibration uncertainties** (globally correlated across all pixels)
+    are propagated *analytically* after the fit and added in quadrature to
+    the bootstrap uncertainty::
 
-        ``σ²_template_eff_i(p) = σ²_template_white_i(p)
-                                   + (f_template_cal_i · template_i(p))²``
+        σ_calib(aᵢ)² = (aᵢ · f_data_cal)² + (aᵢ · f_template_cal_i)²
+        σ_total(aᵢ)  = sqrt(σ_bootstrap(aᵢ)² + σ_calib(aᵢ)²)
 
-    After convergence, coefficient uncertainties are estimated by repeating
-    the full iterative fit on *n_bootstrap* pixel-resampled realisations.
+    This separation is physically motivated: calibration errors shift all
+    pixels by the same factor and therefore cannot be captured by pixel
+    resampling.
 
     Parameters
     ----------
@@ -1145,19 +1365,15 @@ def template_fit_bootstrap(
     else:
         X = template_vecs
 
-    # ---- Effective variances ----
-    sigma2_data_eff, sigma2_template_eff = _compute_effective_sigmas(
-        data_vec=y,
-        template_vecs=template_vecs,
+    # ---- White-noise variances (used in the fit and bootstrap) ----
+    sigma2_data_white, sigma2_template_white = _compute_white_noise_sigmas(
         data_rms_vec=data_rms_vec,
         template_rms_vecs=template_rms_vecs,
-        data_calib_frac=data_calib_frac,
-        template_calib_frac=template_calib_frac,
     )
 
     # ---- Iterative fit on full data ----
     fit, sigma_best, n_iter_done, converged = _run_iterative_fit(
-        y, X, sigma2_data_eff, sigma2_template_eff, ntemp, n_iter, tol
+        y, X, sigma2_data_white, sigma2_template_white, ntemp, n_iter, tol
     )
 
     if not converged:
@@ -1179,7 +1395,7 @@ def template_fit_bootstrap(
     residual_map[valid] = y - model_map[valid]
     sigma_eff_map[valid] = sigma_best
 
-    # ---- Bootstrap ----
+    # ---- Bootstrap (white-noise weights only) ----
     if bootstrap_mode != "pixel":
         raise ValueError("Currently, bootstrap_mode must be 'pixel'.")
 
@@ -1205,8 +1421,8 @@ def template_fit_bootstrap(
 
         y_b = y[idx]
         X_b = X[idx]
-        sigma2_data_b = sigma2_data_eff[idx]
-        sigma2_template_b = sigma2_template_eff[idx]
+        sigma2_data_b = sigma2_data_white[idx]
+        sigma2_template_b = sigma2_template_white[idx]
 
         fit_b, _, _, converged_k = _run_iterative_fit(
             y_b, X_b, sigma2_data_b, sigma2_template_b, ntemp, n_iter, tol
@@ -1220,6 +1436,12 @@ def template_fit_bootstrap(
     beta_boot_std = np.nanstd(beta_boot, axis=0, ddof=1)
     beta_boot_cov = np.cov(beta_boot, rowvar=False)
 
+    # ---- Calibration uncertainty (analytic, globally correlated) ----
+    beta_calib_error = _compute_calib_uncertainty_on_beta(
+        beta_best, ntemp, data_calib_frac, template_calib_frac
+    )
+    beta_total_error = np.sqrt(beta_boot_std ** 2 + beta_calib_error ** 2)
+
     # ---- Organise output ----
     coefficients = {
         name: {
@@ -1227,6 +1449,8 @@ def template_fit_bootstrap(
             "formal_error": fit["formal_error"][i],
             "bootstrap_mean": beta_boot_mean[i],
             "bootstrap_error": beta_boot_std[i],
+            "calib_error": beta_calib_error[i],
+            "total_error": beta_total_error[i],
         }
         for i, name in enumerate(beta_names)
     }
@@ -1239,6 +1463,8 @@ def template_fit_bootstrap(
         beta_bootstrap_mean=beta_boot_mean,
         beta_bootstrap_error=beta_boot_std,
         beta_bootstrap_cov=beta_boot_cov,
+        beta_calib_error=beta_calib_error,
+        beta_total_error=beta_total_error,
         model_map=model_map,
         residual_map=residual_map,
         sigma_eff_map=sigma_eff_map,
