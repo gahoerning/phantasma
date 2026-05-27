@@ -161,7 +161,13 @@ rms_out = ph.propagate_rms_cutout(
 
 Fits multi-component astrophysical models with optional spatial gradients and full parameter covariance:
 
-$$\text{data\_map} = \sum_{i} a_i \cdot \text{template}_i + \sum_{j} b_j \cdot \text{geom}_j + \text{residual}$$
+$$\mathbf{d} = \sum_{i} a_i \mathbf{t}_i + \sum_{j} b_j \mathbf{g}_j + \mathbf{r}$$
+
+where:
+- $\mathbf{d}$ is the data map (`data_map`)
+- $\mathbf{t}_i$ are the foreground template maps (`template_maps`)
+- $\mathbf{g}_j$ are the geometric templates (`geom_templates`)
+- $\mathbf{r}$ is the residual map
 
 #### Setup and Fitting (Quickstart)
 
