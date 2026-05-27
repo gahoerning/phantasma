@@ -21,7 +21,7 @@ Usage
     result.summary()
 """
 
-from .cutoff_processing import smooth_cutout, make_target_wcs
+from .cutoff_processing import smooth_cutout, make_target_wcs, propagate_rms_cutout
 from .template_fitting import (
     TemplateFitResult,
     make_geometric_templates,
@@ -34,6 +34,7 @@ __all__ = [
     # cutoff_processing
     "smooth_cutout",
     "make_target_wcs",
+    "propagate_rms_cutout",
     # template_fitting
     "TemplateFitResult",
     "make_geometric_templates",

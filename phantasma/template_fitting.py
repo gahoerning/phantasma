@@ -222,6 +222,25 @@ class TemplateFitResult:
     bootstrap_mode : str or None
         Bootstrap sampling mode (currently always ``"pixel"``).
 
+    beta_cov : ndarray, shape (Npar, Npar)
+        Parameter covariance matrix. Holds bootstrap covariance matrix if
+        bootstrap was performed, otherwise the formal covariance matrix.
+
+    beta_corr : ndarray, shape (Npar, Npar)
+        Parameter correlation matrix derived from ``beta_cov``.
+
+    pearson_r : float
+        Pearson correlation coefficient between the actual data map and the
+        best-fit model map, computed within the valid-pixel mask.
+
+    r2 : float
+        Coefficient of determination (R-squared) between the data map and
+        the best-fit model map, computed within the valid-pixel mask.
+
+    template_corr : ndarray, shape (Npar, Npar)
+        Spatial correlation matrix between the template maps (including
+        geometric templates, if any), computed within the valid-pixel mask.
+
     beta_bootstrap_samples : ndarray or None, shape (n_bootstrap, Npar)
         Raw bootstrap samples (only when ``return_bootstrap_samples=True``).
     """
@@ -248,11 +267,25 @@ class TemplateFitResult:
     bootstrap_chi2_red: Optional[np.ndarray]
     bootstrap_converged: Optional[np.ndarray]
     bootstrap_mode: Optional[str]
+    beta_cov: np.ndarray
+    beta_corr: np.ndarray
+    pearson_r: float
+    r2: float
+    template_corr: np.ndarray
     beta_bootstrap_samples: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
     # Convenience methods
     # ------------------------------------------------------------------
+
+    def _format_correlation_matrix(self, names: list[str], matrix: np.ndarray) -> str:
+        lines = []
+        header = f"{'':<16}" + "".join(f"{name[:11]:>12}" for name in names)
+        lines.append(header)
+        for i, name in enumerate(names):
+            row = f"{name[:16]:<16}" + "".join(f"{matrix[i, j]:>12.3f}" for j in range(len(names)))
+            lines.append(row)
+        return "\n".join(lines)
 
     def summary(self, n_sig: int = 2) -> dict:
         """
@@ -295,6 +328,30 @@ class TemplateFitResult:
                         "calib_error" : float,
                         "total_error" : float,
                     }}
+
+            ``"chi2"``
+                Best-fit absolute chi-squared.
+
+            ``"chi2_red"``
+                Reduced chi-squared.
+
+            ``"ndof"``
+                Degrees of freedom.
+
+            ``"pearson_r"``
+                Pearson correlation coefficient.
+
+            ``"r2"``
+                R-squared.
+
+            ``"beta_cov"``
+                Covariance matrix of parameters.
+
+            ``"beta_corr"``
+                Correlation matrix of parameters.
+
+            ``"template_corr"``
+                Template spatial correlation matrix.
         """
         has_boot = self.beta_bootstrap_error is not None
 
@@ -356,8 +413,11 @@ class TemplateFitResult:
             lines.append(row)
 
         lines.append("-" * col_w)
+        lines.append(f"\u03c7\u00b2        = {self.chi2:.4f}")
         lines.append(f"\u03c7\u00b2_red    = {self.chi2_red:.4f}  (white-noise weights only)")
         lines.append(f"ndof      = {self.ndof}")
+        lines.append(f"Pearson r = {self.pearson_r:.4f}  (data vs model)")
+        lines.append(f"R\u00b2        = {self.r2:.4f}  (coefficient of determination)")
         lines.append(f"n_pix     = {self.n_pix}")
         lines.append(f"n_iter    = {self.n_iter_done}")
         lines.append(
@@ -367,6 +427,17 @@ class TemplateFitResult:
             n_boot_conv = int(np.sum(self.bootstrap_converged))
             n_boot = len(self.bootstrap_converged)
             lines.append(f"bootstrap convergence: {n_boot_conv}/{n_boot}")
+
+        # Add correlation matrices if we have multiple parameters
+        if len(self.beta_names) > 1:
+            lines.append("-" * col_w)
+            lines.append("Parameter Correlation Matrix:")
+            lines.append(self._format_correlation_matrix(self.beta_names, self.beta_corr))
+            lines.append("-" * col_w)
+            lines.append("Template Spatial Correlation Matrix (within mask):")
+            lines.append(self._format_correlation_matrix(self.beta_names, self.template_corr))
+
+        lines.append("-" * col_w)
         lines.append(
             f"rounding: {n_sig} significant figure(s) in the uncertainty  "
             f"[use result.summary(n_sig=N) to change]"
@@ -375,7 +446,19 @@ class TemplateFitResult:
 
         text = "\n".join(lines)
         print(text)
-        return {"text": text, "rounded": rounded, "raw": raw}
+        return {
+            "text": text,
+            "rounded": rounded,
+            "raw": raw,
+            "chi2": self.chi2,
+            "chi2_red": self.chi2_red,
+            "ndof": self.ndof,
+            "pearson_r": self.pearson_r,
+            "r2": self.r2,
+            "beta_cov": self.beta_cov,
+            "beta_corr": self.beta_corr,
+            "template_corr": self.template_corr,
+        }
 
     def component_maps(self, template_maps: np.ndarray) -> np.ndarray:
         """
@@ -403,6 +486,21 @@ class TemplateFitResult:
         ntemp = template_maps.shape[0]
         beta_phys = self.beta[:ntemp]
         return beta_phys[:, None, None] * template_maps
+
+    @property
+    def fractional_residual_map(self) -> np.ndarray:
+        """
+        Compute the fractional residual map: ``(data_map - model_map) / data_map``.
+
+        Returns
+        -------
+        frac_map : ndarray, shape (ny, nx)
+            Fractional residual map (NaN outside valid mask or where data is 0).
+        """
+        data = self.model_map + self.residual_map
+        with np.errstate(divide="ignore", invalid="ignore"):
+            frac = self.residual_map / data
+        return frac
 
 
 # ============================================================
@@ -1132,6 +1230,29 @@ def template_fit(
     )
     beta_total_error = np.sqrt(fit["formal_error"] ** 2 + beta_calib_error ** 2)
 
+    # ---- Additional statistics ----
+    y_model = X @ beta_best
+    if y.size > 1 and np.std(y) > 0 and np.std(y_model) > 0:
+        pearson_r = float(np.corrcoef(y, y_model)[0, 1])
+    else:
+        pearson_r = 0.0
+
+    if y.size > 1 and np.std(y) > 0:
+        r2 = float(1.0 - np.sum((y - y_model) ** 2) / np.sum((y - np.mean(y)) ** 2))
+    else:
+        r2 = 0.0
+
+    beta_cov = np.atleast_2d(fit["cov_scaled"])
+    diag = np.diag(beta_cov)
+    std = np.sqrt(np.where(diag > 0, diag, 1.0))
+    beta_corr = np.clip(beta_cov / std[:, None] / std[None, :], -1.0, 1.0)
+
+    if X.shape[0] > 1:
+        template_corr = np.corrcoef(X, rowvar=False)
+        template_corr = np.atleast_2d(template_corr)
+    else:
+        template_corr = np.eye(n_par)
+
     # ---- Organise output ----
     coefficients = {
         name: {
@@ -1168,6 +1289,11 @@ def template_fit(
         bootstrap_chi2_red=None,
         bootstrap_converged=None,
         bootstrap_mode=None,
+        beta_cov=beta_cov,
+        beta_corr=beta_corr,
+        pearson_r=pearson_r,
+        r2=r2,
+        template_corr=template_corr,
     )
 
 
@@ -1442,6 +1568,29 @@ def template_fit_bootstrap(
     )
     beta_total_error = np.sqrt(beta_boot_std ** 2 + beta_calib_error ** 2)
 
+    # ---- Additional statistics ----
+    y_model = X @ beta_best
+    if y.size > 1 and np.std(y) > 0 and np.std(y_model) > 0:
+        pearson_r = float(np.corrcoef(y, y_model)[0, 1])
+    else:
+        pearson_r = 0.0
+
+    if y.size > 1 and np.std(y) > 0:
+        r2 = float(1.0 - np.sum((y - y_model) ** 2) / np.sum((y - np.mean(y)) ** 2))
+    else:
+        r2 = 0.0
+
+    beta_cov = np.atleast_2d(beta_boot_cov)
+    diag = np.diag(beta_cov)
+    std = np.sqrt(np.where(diag > 0, diag, 1.0))
+    beta_corr = np.clip(beta_cov / std[:, None] / std[None, :], -1.0, 1.0)
+
+    if X.shape[0] > 1:
+        template_corr = np.corrcoef(X, rowvar=False)
+        template_corr = np.atleast_2d(template_corr)
+    else:
+        template_corr = np.eye(n_par)
+
     # ---- Organise output ----
     coefficients = {
         name: {
@@ -1478,6 +1627,11 @@ def template_fit_bootstrap(
         bootstrap_chi2_red=chi2_boot,
         bootstrap_converged=converged_boot,
         bootstrap_mode=bootstrap_mode,
+        beta_cov=beta_cov,
+        beta_corr=beta_corr,
+        pearson_r=pearson_r,
+        r2=r2,
+        template_corr=template_corr,
     )
 
     if return_bootstrap_samples:

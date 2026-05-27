@@ -568,3 +568,343 @@ def _read_fits(data, wcs, center_l, center_b, padded_size_deg):
         wcs_out = raw_wcs
 
     return data_out, wcs_out, pixel_scale_arcmin
+
+
+# ======================================================================
+#  Private helper: smooth + reproject a single flat-sky noise realization
+# ======================================================================
+
+def _smooth_and_reproject_flat(
+    noise_flat,
+    flat_wcs,
+    total_sigma_pix,
+    target_wcs,
+    target_shape,
+):
+    """
+    Apply Gaussian smoothing and exact reprojection to one flat-sky 2-D array.
+
+    The ``noise_flat`` array is treated as raw white noise (i.e. it has
+    **not** yet been smoothed by any beam).  The function convolves with
+    the **total** target Gaussian kernel (beam + extra smoothing combined in
+    quadrature via ``total_sigma_pix``) and then reprojects to the output
+    WCS.  This ensures the output amplitude correctly reflects the noise
+    after the full pipeline.
+
+    Parameters
+    ----------
+    noise_flat : 2-D ndarray
+        Raw white-noise realisation on the intermediate flat-sky grid.
+        Amplitude is the underlying WN std per pixel (``sigma_WN``).
+    flat_wcs : astropy.wcs.WCS
+        WCS of ``noise_flat``.
+    total_sigma_pix : float or None
+        Sigma [pixels] of the **total** Gaussian kernel to apply
+        (combining original beam and additional smoothing).  Pass ``None``
+        or ≤ 0 if no smoothing is needed.
+    target_wcs : astropy.wcs.WCS
+        Output WCS.
+    target_shape : tuple of int
+        Output grid shape ``(ny, nx)``.
+
+    Returns
+    -------
+    out : 2-D ndarray, shape ``target_shape``
+        Smoothed and reprojected noise realisation (NaN outside footprint).
+    """
+    proc = noise_flat.copy()
+
+    if total_sigma_pix is not None and total_sigma_pix > 0:
+        kernel = Gaussian2DKernel(x_stddev=total_sigma_pix)
+        proc = convolve(
+            proc, kernel,
+            boundary="fill",
+            fill_value=0.0,         # WN outside the patch contributes zero
+            nan_treatment="fill",   # NaN → 0 to avoid contaminating interior
+            preserve_nan=False,
+        )
+
+    input_hdu = fits.PrimaryHDU(data=proc, header=flat_wcs.to_header())
+    reprojected, footprint = reproject_exact(
+        input_hdu, target_wcs, shape_out=target_shape,
+    )
+    reprojected = np.where(footprint > 0, reprojected, np.nan)
+    return reprojected
+
+
+# ======================================================================
+#  Public function: RMS propagation
+# ======================================================================
+
+def propagate_rms_cutout(
+    rms_data,
+    map_format,
+    rms_is_constant,
+    original_res_arcmin,
+    target_res_arcmin,
+    pixel_size_arcmin,
+    target_wcs,
+    target_shape,
+    center_l=0.0,
+    center_b=0.0,
+    cutout_size_deg=1.0,
+    original_wcs=None,
+    n_mc=None,
+    random_seed=None,
+    healpix_coord="G",
+):
+    """
+    Propagate an RMS map through the smooth-and-reproject pipeline.
+
+    Three regimes are supported:
+
+    **Constant RMS** (``rms_is_constant=True``)
+        Applies the exact analytical formula for white noise through a
+        Gaussian beam and flux-conserving reprojection::
+
+            σ_out = σ_in × (p₀/p₁) × (θ_eff_orig / θ_eff_target)
+
+        where ``θ_eff = sqrt(θ_beam² + θ_pix²)`` is the effective resolution
+        including the pixel window function.  ``rms_data`` must be a scalar
+        float.  Returns a constant 2-D map of shape ``target_shape``.
+
+    **Spatially varying FITS RMS** (``rms_is_constant=False``,
+    ``map_format='fits'``)
+        Uses Monte Carlo (``n_mc`` realisations) to propagate the noise.
+        A padded cutout of the RMS map is extracted first so that
+        simulations run only on the relevant sky patch.  Each realisation
+        is white noise drawn pixel-by-pixel from the RMS values, then
+        processed through the same smooth-and-reproject pipeline as the
+        data.  The output RMS is the standard deviation of the
+        realisations.
+
+    **Spatially varying HEALPix RMS** (``rms_is_constant=False``,
+    ``map_format='healpix'``)
+        The HEALPix RMS map is first reprojected onto a small flat-sky
+        intermediate grid (same padded region used by ``smooth_cutout``).
+        From that point on, the computation is identical to the FITS case
+        above, keeping memory usage proportional to the cutout area rather
+        than the full-sky HEALPix array.
+
+    Parameters
+    ----------
+    rms_data : float or ndarray
+        - ``float`` when ``rms_is_constant=True``.
+        - 2-D ndarray (FITS) or 1-D ndarray (HEALPix) otherwise.
+    map_format : {'fits', 'healpix'}
+        Format of the input RMS map (ignored when ``rms_is_constant=True``).
+    rms_is_constant : bool
+        If ``True``, uses the exact analytical formula.  ``rms_data`` must
+        be a scalar.
+    original_res_arcmin : float
+        Beam FWHM of the input map [arcmin].
+    target_res_arcmin : float
+        Target beam FWHM after smoothing [arcmin].
+    pixel_size_arcmin : float
+        Output pixel size [arcmin].
+    target_wcs : astropy.wcs.WCS
+        WCS of the output grid (same object used in ``smooth_cutout``).
+    target_shape : tuple of int
+        Output shape ``(ny, nx)`` (same as used in ``smooth_cutout``).
+    center_l : float
+        Galactic longitude of the cutout centre [deg].
+    center_b : float
+        Galactic latitude of the cutout centre [deg].
+    cutout_size_deg : float
+        Angular size of the *final* cutout [deg].  Used to determine the
+        minimum padded area for the MC simulations.
+    original_wcs : astropy.wcs.WCS, optional
+        WCS of the FITS input map.  Required when ``map_format='fits'``
+        and ``rms_is_constant=False``; ignored otherwise.
+    n_mc : int
+        Number of Monte Carlo realisations.  **Required** when
+        ``rms_is_constant=False``.
+    random_seed : int or None
+        Seed for the random number generator (for reproducibility).
+    healpix_coord : {'G', 'C', 'E'}
+        Coordinate system of the HEALPix map.  Default ``'G'`` (Galactic).
+
+    Returns
+    -------
+    rms_out : ndarray, shape ``target_shape``
+        Propagated RMS map on the output grid.  NaN outside the valid
+        footprint.
+
+    Examples
+    --------
+    Constant RMS — exact formula:
+
+    >>> rms_out = propagate_rms_cutout(
+    ...     rms_data=0.02, map_format='fits', rms_is_constant=True,
+    ...     original_res_arcmin=5.0, target_res_arcmin=10.0,
+    ...     pixel_size_arcmin=2.0, target_wcs=wcs, target_shape=(60, 60),
+    ... )
+
+    Spatially varying FITS RMS — Monte Carlo with 300 realisations:
+
+    >>> rms_out = propagate_rms_cutout(
+    ...     rms_data=rms_map, map_format='fits', rms_is_constant=False,
+    ...     original_wcs=fits_wcs,
+    ...     center_l=17.0, center_b=0.8, cutout_size_deg=2.0,
+    ...     original_res_arcmin=5.0, target_res_arcmin=10.0,
+    ...     pixel_size_arcmin=2.0, target_wcs=wcs, target_shape=(60, 60),
+    ...     n_mc=300, random_seed=42,
+    ... )
+    """
+    # ------------------------------------------------------------------
+    # CASE 1 — Constant RMS: exact analytical formula
+    # ------------------------------------------------------------------
+    if rms_is_constant:
+        sigma_in = float(rms_data)
+
+        # We need the original pixel scale.  For a constant-RMS map we
+        # cannot read it from a WCS, so we derive it from the intermediate
+        # grid that _read_healpix / _read_fits would produce.  As a robust
+        # proxy, we use the output pixel size as the reference scale.
+        # The formula only needs p₀; we obtain it from original_wcs (FITS)
+        # or from a dummy HEALPix nside estimate.
+        if map_format == "fits" and original_wcs is not None:
+            pixel_scales_deg = proj_plane_pixel_scales(original_wcs)
+            p0 = float(np.mean(pixel_scales_deg)) * 60.0        # arcmin
+        elif map_format == "healpix":
+            # Cannot determine p0 without data; warn and use pixel_size_arcmin
+            warnings.warn(
+                "propagate_rms_cutout: for HEALPix + rms_is_constant=True, "
+                "the original pixel scale cannot be inferred without data.  "
+                "Pass original_wcs=None and provide a FITS WCS, or use "
+                "rms_is_constant=False with Monte Carlo instead.",
+                stacklevel=2,
+            )
+            p0 = pixel_size_arcmin
+        else:
+            p0 = pixel_size_arcmin
+
+        p1 = pixel_size_arcmin
+
+        # Effective resolutions including pixel window functions
+        pw_orig = _pixel_window_fwhm(p0)
+        pw_new  = _pixel_window_fwhm(p1)
+        theta_eff_orig   = np.sqrt(original_res_arcmin**2   + pw_orig**2)
+        theta_eff_target = np.sqrt(target_res_arcmin**2     + pw_new**2)
+
+        sigma_out = sigma_in * (p0 / p1) * (theta_eff_orig / theta_eff_target)
+        return np.full(target_shape, sigma_out, dtype=float)
+
+    # ------------------------------------------------------------------
+    # CASES 2 & 3 — Spatially varying RMS: Monte Carlo
+    # ------------------------------------------------------------------
+    if n_mc is None:
+        raise ValueError(
+            "n_mc must be provided when rms_is_constant=False."
+        )
+
+    rng = np.random.default_rng(random_seed)
+
+    # Padding around the cutout to avoid edge effects (same as smooth_cutout)
+    padding_deg = 5.0 * target_res_arcmin / 60.0
+    padded_size_deg = cutout_size_deg + 2.0 * padding_deg
+
+    # ------------------------------------------------------------------
+    # Step 1 — Read / reproject the RMS map to a flat-sky intermediate grid
+    # ------------------------------------------------------------------
+    if map_format == "healpix":
+        # Reproject HEALPix RMS to a small flat-sky patch.
+        # This is memory-efficient: only the patch pixels are used,
+        # not the full-sky HEALPix array.
+        rms_flat, flat_wcs, flat_pixel_arcmin = _read_healpix(
+            rms_data, healpix_coord,
+            center_l, center_b, padded_size_deg, pixel_size_arcmin,
+        )
+    elif map_format == "fits":
+        if original_wcs is None:
+            raise ValueError(
+                "original_wcs must be provided when map_format='fits'."
+            )
+        rms_flat, flat_wcs, flat_pixel_arcmin = _read_fits(
+            rms_data, original_wcs,
+            center_l, center_b, padded_size_deg,
+        )
+    else:
+        raise ValueError(f"Unknown map_format: '{map_format}'")
+
+    # Sanitise the RMS flat patch (replace infs, HEALPix UNSEEN, etc.)
+    rms_flat = _sanitise(rms_flat, remove_healpix_unseen=(map_format == "healpix"))
+
+    # Zero or NaN RMS pixels are treated as masked — noise amplitude = 0
+    rms_flat = np.where(np.isfinite(rms_flat) & (rms_flat > 0), rms_flat, 0.0)
+
+    # ------------------------------------------------------------------
+    # Step 2 — Compute kernels needed for the Monte Carlo
+    # ------------------------------------------------------------------
+    # The input RMS map (rms_flat) is the noise of a beam-smoothed map.
+    # The underlying white-noise per pixel is:
+    #     sigma_WN = rms_flat / sqrt(sum(K_b^2))
+    # where K_b is the Gaussian kernel of the original beam.
+    # Each MC realisation draws from WN with that amplitude, then convolves
+    # with the TOTAL kernel K_total = Gaussian(sigma_b ⊕ sigma_extra) and
+    # reprojects.  This is equivalent to simulating the full pipeline from
+    # scratch on raw WN, which correctly propagates correlated noise.
+
+    fwhm_to_sigma = _FWHM_TO_SIGMA  # 1 / (2*sqrt(2*ln2)) ≈ 0.4247
+
+    # Original beam sigma [pixels on the flat intermediate grid]
+    sigma_b_arcmin = original_res_arcmin * fwhm_to_sigma
+    sigma_b_pix    = sigma_b_arcmin / flat_pixel_arcmin
+
+    # Extra smoothing kernel sigma [pixels] — needed to reach target resolution
+    sigma_k_pix, _ = _compute_smoothing_kernel_sigma_pix(
+        original_res_arcmin,
+        target_res_arcmin,
+        orig_pixel_size_arcmin=flat_pixel_arcmin,
+        new_pixel_size_arcmin=pixel_size_arcmin,
+        current_pixel_scale_arcmin=flat_pixel_arcmin,
+    )
+
+    # Total kernel: combine beam and extra kernel in quadrature
+    if sigma_k_pix is not None and sigma_k_pix > 0:
+        sigma_total_pix = np.sqrt(sigma_b_pix**2 + sigma_k_pix**2)
+    else:
+        sigma_total_pix = sigma_b_pix  # no additional smoothing needed
+
+    # Amplitude correction: convert rms_flat (noise of beam-smoothed map)
+    # to sigma_WN (noise of the underlying raw WN field).
+    # For a Gaussian kernel: sum(K^2) = 1 / (4*pi*sigma_pix^2)  [continuous limit]
+    # Using the actual discrete kernel avoids small numerical errors.
+    if sigma_b_pix > 0:
+        K_b = Gaussian2DKernel(x_stddev=sigma_b_pix)
+        sum_Kb_sq = np.sum(K_b.array ** 2)
+    else:
+        sum_Kb_sq = 1.0   # no beam → sigma_WN = rms_flat
+
+    # sigma_WN per pixel (spatially varying field)
+    sigma_WN_flat = rms_flat / np.sqrt(sum_Kb_sq)
+
+    # ------------------------------------------------------------------
+    # Step 3 — Monte Carlo: generate WN realisations and propagate
+    # ------------------------------------------------------------------
+    ny_flat, nx_flat = rms_flat.shape
+    out_stack = np.empty((n_mc, *target_shape), dtype=float)
+
+    for k in range(n_mc):
+        # Draw raw white noise scaled by sigma_WN per pixel
+        noise_k = rng.standard_normal((ny_flat, nx_flat)) * sigma_WN_flat
+
+        # Apply total kernel (beam + extra) and reproject to target WCS
+        out_stack[k] = _smooth_and_reproject_flat(
+            noise_k,
+            flat_wcs,
+            sigma_total_pix,
+            target_wcs,
+            target_shape,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 4 — RMS = std of realisations (ddof=1 for unbiased estimate)
+    # ------------------------------------------------------------------
+    rms_out = np.nanstd(out_stack, axis=0, ddof=1)
+
+    # Pixels where all realisations are NaN → keep NaN
+    all_nan = np.all(~np.isfinite(out_stack), axis=0)
+    rms_out[all_nan] = np.nan
+
+    return rms_out
