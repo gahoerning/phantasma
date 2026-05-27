@@ -42,7 +42,9 @@ def _pixel_window_fwhm(pixel_size_arcmin):
     float
         Approximate pixel window FWHM in arcmin.
     """
-    return (1.0 / _FWHM_TO_SIGMA) * pixel_size_arcmin / np.sqrt(12.0)
+    # Gaussian approximation of the square pixel top-hat:
+    # sigma_pixel = pixel / sqrt(12), FWHM = 2*sqrt(2*ln2) * sigma_pixel
+    return 2.0 * np.sqrt(2.0 * np.log(2.0)) * pixel_size_arcmin / np.sqrt(12.0)
 
 
 def _compute_smoothing_kernel_sigma_pix(
@@ -118,6 +120,184 @@ def _compute_smoothing_kernel_sigma_pix(
     sigma_pix = sigma_kernel_arcmin / current_pixel_scale_arcmin
 
     return sigma_pix, fwhm_kernel
+
+
+# ======================================================================
+#  Beam-profile helpers (non-Gaussian beam support)
+# ======================================================================
+
+def _make_beam_evaluator(beam_spec):
+    """
+    Convert a beam specification to a callable ``B(ell) -> ndarray``.
+
+    Parameters
+    ----------
+    beam_spec : float, tuple, or callable
+        - **float** — Gaussian FWHM in arcmin.
+          ``B(ℓ) = exp(−ℓ(ℓ+1) σ²/2)`` with ``σ = FWHM_rad × _FWHM_TO_SIGMA``.
+        - **tuple** ``(ell_array, B_ell_array)`` — tabulated beam from a
+          survey or simulation; interpolated linearly, extrapolated as
+          ``B(0) = B_ell_array[0]`` and ``B(ℓ > ℓ_max) = 0``.
+        - **callable** — used directly as ``B(ell)``.
+
+    Returns
+    -------
+    callable : B(ell) -> ndarray
+    """
+    if isinstance(beam_spec, (int, float)):
+        fwhm_rad = float(beam_spec) * (np.pi / (180.0 * 60.0))   # arcmin → rad
+        sigma2   = (fwhm_rad * _FWHM_TO_SIGMA) ** 2
+        def _gauss(ell, _s2=sigma2):
+            ell = np.asarray(ell, dtype=float)
+            return np.exp(-0.5 * ell * (ell + 1.0) * _s2)
+        return _gauss
+    elif callable(beam_spec):
+        return beam_spec
+    else:
+        # (ell_array, B_ell_array) tuple — tabulated beam
+        from scipy.interpolate import interp1d
+        ell_arr = np.asarray(beam_spec[0], dtype=float)
+        b_arr   = np.asarray(beam_spec[1], dtype=float)
+        _interp  = interp1d(ell_arr, b_arr, kind='linear',
+                            bounds_error=False,
+                            fill_value=(b_arr[0], 0.0))
+        return lambda ell: _interp(np.asarray(ell, dtype=float))
+
+
+def _beam_effective_fwhm(beam_eval, ell_max=10_000):
+    """
+    Estimate the effective FWHM [arcmin] of a beam B(ℓ) as the
+    angular scale where B first drops to 0.5 (half-power beam width).
+
+    Parameters
+    ----------
+    beam_eval : callable
+        ``B(ell) -> ndarray``
+    ell_max : int
+        Maximum multipole to search over.
+
+    Returns
+    -------
+    float
+        FWHM in arcmin.  Returns 0 if B stays ≥ 0.5 everywhere.
+    """
+    ell  = np.arange(0, ell_max + 1, dtype=float)
+    B    = np.asarray(beam_eval(ell), dtype=float)
+    below = np.where(B < 0.5)[0]
+    if len(below) == 0:
+        return 0.0
+    ell_half = float(below[0])
+    if ell_half <= 0:
+        return float('inf')
+    # For a Gaussian beam B(ℓ) = exp(-0.5 ℓ² σ²) = 0.5 at ℓ_half = sqrt(2·ln2)/σ
+    # => FWHM_rad = 2·sqrt(2·ln2)·σ = 4·ln2 / ℓ_half
+    fwhm_arcmin = (4.0 * np.log(2.0) / ell_half) * (180.0 * 60.0 / np.pi)
+    return fwhm_arcmin
+
+
+def _apply_beam_transfer_2d(
+    data_2d,
+    pixel_arcmin,
+    input_beam_eval,
+    target_beam_eval,
+    regularization=1e-4,
+):
+    """
+    Apply a beam transfer function in 2D Fourier space.
+
+    **Mathematical equivalence with HEALPix**
+
+    On the sphere, the standard operation is to multiply the spherical
+    harmonic coefficients by::
+
+        T_HEALPix(ℓ) = [B_new(ℓ) × P_new(ℓ)] / [B_old(ℓ) × P_old(ℓ)]
+
+    where *P* is the pixel window function and *P_new* is added implicitly
+    by ``hp.alm2map``.  The flat-sky analogue (used here) multiplies the 2D
+    Fourier modes of the intermediate map by::
+
+        T_applied(k) = B_target(ℓ) × H_in(k) / (H_in(k)² + ε²)
+
+    where ``H_in(k) = B_input(ℓ(k)) × sinc(kx p) × sinc(ky p)`` is the
+    combined input beam + pixel window, and ``ε`` provides Wiener
+    regularisation.  ``reproject_exact`` then adds the output pixel window
+    ``P_new`` implicitly, so the total effective transfer is::
+
+        T_total = B_target × P_new    ✓
+
+    The flat-sky ↔ ℓ relation is ``ℓ = 2π k / arcmin_per_rad``.
+
+    Parameters
+    ----------
+    data_2d : 2-D ndarray
+        Input map on a flat-sky intermediate grid.  NaN pixels are
+        inpainted before the FFT (using a 1-pixel Gaussian) and restored
+        afterwards.
+    pixel_arcmin : float
+        Pixel size of ``data_2d`` [arcmin].
+    input_beam_eval : callable
+        ``B_input(ell) -> ndarray`` — total effective beam of the input map,
+        including any pixel window of the original survey pixelisation.
+    target_beam_eval : callable
+        ``B_target(ell) -> ndarray`` — desired output beam.  Typically a
+        Gaussian obtained from ``_make_beam_evaluator(target_fwhm_arcmin)``.
+    regularization : float
+        Wiener regularisation parameter.  The noise floor is set to
+        ``regularization × max|H_in|``.  Default ``1e-4``.
+
+    Returns
+    -------
+    smoothed : 2-D ndarray, same shape as ``data_2d``.
+        NaN pixels from the input are preserved in the output.
+    """
+    ny, nx = data_2d.shape
+
+    # --- Inpaint NaN pixels before FFT ---
+    nan_mask = ~np.isfinite(data_2d)
+    if nan_mask.any():
+        fill_kernel = Gaussian2DKernel(x_stddev=1.0)
+        data_filled = convolve(
+            data_2d, fill_kernel,
+            boundary='fill', fill_value=0.0,
+            nan_treatment='interpolate', preserve_nan=False,
+        )
+        data_filled = np.where(nan_mask, data_filled, data_2d)
+    else:
+        data_filled = data_2d
+
+    # --- 2D frequency grid (cycles / arcmin) ---
+    fy = np.fft.fftfreq(ny, d=pixel_arcmin)   # shape (ny,)
+    fx = np.fft.fftfreq(nx, d=pixel_arcmin)   # shape (nx,)
+    FX, FY = np.meshgrid(fx, fy, indexing='xy')  # both (ny, nx)
+
+    # Multipole ℓ (flat-sky approximation: ℓ = 2π k_rad⁻¹)
+    arcmin_per_rad = 180.0 * 60.0 / np.pi
+    K_mag = np.sqrt(FX**2 + FY**2)              # cycles/arcmin
+    ELL   = 2.0 * np.pi * K_mag * arcmin_per_rad  # dimensionless ℓ
+
+    # --- Evaluate beams on the 2D ℓ grid ---
+    B_in  = np.clip(np.asarray(input_beam_eval(ELL),  dtype=float), 0.0, None)
+    B_tgt = np.clip(np.asarray(target_beam_eval(ELL), dtype=float), 0.0, None)
+
+    # --- Exact pixel window of the input intermediate grid ---
+    # For a square pixel of side p: P(fx,fy) = sinc(fx·p) × sinc(fy·p)
+    # (numpy sinc is normalized: sinc(x) = sin(πx)/(πx))
+    P_orig = np.sinc(FX * pixel_arcmin) * np.sinc(FY * pixel_arcmin)
+
+    # --- Combined input transfer H_in and Wiener-regularised T ---
+    H_in = B_in * P_orig
+    eps  = regularization * float(np.max(np.abs(H_in))) if H_in.max() > 0 else 1e-10
+    T    = B_tgt * H_in / (H_in**2 + eps**2)
+
+    # --- Apply in Fourier space ---
+    D_fft     = np.fft.fft2(data_filled)
+    smoothed  = np.real(np.fft.ifft2(D_fft * T))
+
+    # Restore NaN mask
+    if nan_mask.any():
+        smoothed[nan_mask] = np.nan
+
+    return smoothed
 
 
 def _create_intermediate_wcs(center_l, center_b, size_deg, pixel_size_arcmin):
@@ -210,12 +390,15 @@ def smooth_cutout(
     center_l=0.0,
     center_b=0.0,
     cutout_size_deg=1.0,
-    original_res_arcmin=5.0,
-    target_res_arcmin=10.0,
+    original_res_arcmin=None,
+    target_res_arcmin=None,
+    input_beam=None,
+    target_beam=None,
     pixel_size_arcmin=1.0,
     target_wcs=None,
     target_shape=None,
     healpix_coord="G",
+    beam_regularization=1e-4,
 ):
     """
     Smooth an astronomical map to a target resolution and reproject it onto
@@ -242,8 +425,7 @@ def smooth_cutout(
         When provided, pixels are weighted by inverse variance (``w = 1/rms²``)
         during both the Gaussian smoothing and the reprojection steps.  Pixels
         where the RMS is zero or NaN receive zero weight and do not contribute
-        to the output.  The RMS map itself is **not** smoothed or propagated;
-        only the original values are used as weights.
+        to the output.
     original_wcs : astropy.wcs.WCS, optional
         WCS of the original FITS map.  Required when ``map_format='fits'``;
         ignored for ``'healpix'`` (Nside is inferred from the array length).
@@ -253,66 +435,101 @@ def smooth_cutout(
         Galactic latitude of the cutout centre [deg].
     cutout_size_deg : float
         Angular size of the cutout [deg].
-    original_res_arcmin : float
-        Original *beam* FWHM of the input map [arcmin].  This is the
-        Gaussian beam only — the pixel window is accounted for separately
-        using the pixel scales.
-    target_res_arcmin : float
-        Desired *total effective* FWHM after smoothing and reprojection
-        [arcmin].
+    original_res_arcmin : float, optional
+        **Deprecated alias** for ``input_beam`` — Gaussian FWHM of the input
+        beam [arcmin].  Kept for backward compatibility.
+    target_res_arcmin : float, optional
+        **Deprecated alias** for ``target_beam`` — Gaussian FWHM of the
+        desired output beam [arcmin].  Kept for backward compatibility.
+    input_beam : float, tuple, or callable, optional
+        Beam profile of the input map.  Accepts:
+
+        - **float** — Gaussian FWHM [arcmin].  Equivalent to the old
+          ``original_res_arcmin`` parameter.
+        - **tuple** ``(ell_array, B_ell_array)`` — tabulated beam transfer
+          function as measured for the survey (e.g. downloaded from a survey
+          website).  Interpolated linearly; extrapolated as ``B(ℓ → ∞) = 0``.
+        - **callable** ``B(ell) -> ndarray`` — arbitrary beam function.
+
+        When a Gaussian float is given, the code follows the original
+        Gaussian-kernel path (backward compatible, exact NaN handling).
+        For any other type the beam transfer is applied in 2D Fourier space
+        using Wiener regularisation (see ``beam_regularization``).
+    target_beam : float, optional
+        Target beam FWHM [arcmin] (always Gaussian).  Equivalent to the old
+        ``target_res_arcmin`` parameter.
     pixel_size_arcmin : float
-        Pixel size of the *output* grid [arcmin].  Used both to compute the
-        pixel window correction and to determine the output grid shape.
+        Pixel size of the *output* grid [arcmin].
     target_wcs : astropy.wcs.WCS
         WCS of the output grid.
     target_shape : tuple of int, optional
-        Shape ``(ny, nx)`` of the output grid.  Computed automatically from
-        ``pixel_size_arcmin`` and ``cutout_size_deg`` if not provided.
+        Shape ``(ny, nx)`` of the output grid.  Computed automatically if not
+        provided.
     healpix_coord : str, optional
-        Coordinate system of the HEALPix map: ``'G'`` (Galactic), ``'C'``
-        (Celestial/Equatorial), ``'E'`` (Ecliptic).  Default ``'G'``.
+        Coordinate system of the HEALPix map (``'G'``, ``'C'``, ``'E'``).
+    beam_regularization : float, optional
+        Wiener regularisation strength for the Fourier-space beam transfer.
+        The noise floor is set to ``beam_regularization × max|H_in|``.
+        Only used when ``input_beam`` is non-Gaussian.  Default ``1e-4``.
 
     Returns
     -------
     cutout_data : numpy.ndarray
         2-D map reprojected onto ``target_wcs`` with NaN for invalid pixels.
     target_wcs : astropy.wcs.WCS
-        The WCS of the returned map (same object as the input ``target_wcs``).
+        The WCS of the returned map.
 
     Notes
     -----
     **Pixel window correction**
 
-    The input data has already been smoothed by the original beam *and* the
-    original pixel window.  ``reproject_exact`` will add the output pixel
-    window.  The smoothing kernel subtracts all three contributions so that
-    the final effective resolution equals ``target_res_arcmin``::
+    In the Gaussian path the smoothing kernel is computed from::
 
         FWHM_kernel^2 = FWHM_target^2 - FWHM_beam^2
                       - FWHM_pix_orig^2 - FWHM_pix_new^2
 
-    where  FWHM_pix ≈ 0.68 × pixel_size  (Gaussian approximation of a
-    square top-hat pixel window).
+    In the Fourier path the exact sinc pixel window is used, exactly
+    mirroring the HEALPix operation of multiplying alms by::
+
+        T(ℓ) = [B_target(ℓ) × P_new(ℓ)] / [B_input(ℓ) × P_old(ℓ)]
 
     **Weighted smoothing (when rms_data is provided)**
 
-    The weighted convolution is computed as::
-
-        w = 1 / rms²
-        data_smooth = convolve(w * data, K) / convolve(w, K)
-
-    For reprojection, numerator and denominator are reprojected separately::
-
-        data_out = reproject(w_smooth * data_smooth) / reproject(w_smooth)
-
-    where ``w_smooth = convolve(w, K)`` are the weights after smoothing.
+    Gaussian path: ``data_smooth = convolve(w·data, K) / convolve(w, K)``.
+    Fourier path: NaN pixels are inpainted before the FFT; ``w`` is used
+    unchanged for the weighted ``reproject_exact`` step.
     """
+    # ------------------------------------------------------------------
+    # Resolve beam specifications (backward compatibility)
+    # ------------------------------------------------------------------
+    if input_beam is None and original_res_arcmin is not None:
+        input_beam = float(original_res_arcmin)
+    if target_beam is None and target_res_arcmin is not None:
+        target_beam = float(target_res_arcmin)
+    if input_beam is None:
+        raise ValueError(
+            "Provide input_beam (float FWHM in arcmin, (ell,B_ell) tuple, "
+            "or callable).  The deprecated original_res_arcmin is also accepted."
+        )
+    if target_beam is None:
+        raise ValueError(
+            "Provide target_beam (float FWHM in arcmin).  "
+            "The deprecated target_res_arcmin is also accepted."
+        )
+
+    # Build evaluators; detect whether we can use the fast Gaussian path
+    _input_is_gaussian = isinstance(input_beam, (int, float))
+    input_beam_eval    = _make_beam_evaluator(input_beam)
+    target_beam_eval   = _make_beam_evaluator(target_beam)   # always Gaussian
+
+    # Effective FWHMs for padding and Gaussian-path kernel computation
+    _input_fwhm  = float(input_beam) if _input_is_gaussian else _beam_effective_fwhm(input_beam_eval)
+    _target_fwhm = float(target_beam)   # target is always a Gaussian float
+
     if target_wcs is None:
         raise ValueError("target_wcs must be provided.")
-    if original_res_arcmin <= 0:
-        raise ValueError("original_res_arcmin must be positive.")
-    if target_res_arcmin <= 0:
-        raise ValueError("target_res_arcmin must be positive.")
+    if _target_fwhm <= 0:
+        raise ValueError("target_beam must be a positive FWHM [arcmin].")
     if pixel_size_arcmin <= 0:
         raise ValueError("pixel_size_arcmin must be positive.")
     if cutout_size_deg <= 0:
@@ -332,7 +549,9 @@ def smooth_cutout(
     # ------------------------------------------------------------------
     # Padding around the cutout to avoid edge effects from convolution.
     # 5× the target FWHM is generous (kernel is ~4σ ≈ 1.7 FWHM).
-    padding_deg = 5.0 * target_res_arcmin / 60.0
+    # For non-Gaussian beams we use the estimated effective FWHM.
+    _pad_fwhm   = max(_target_fwhm, _input_fwhm if _input_fwhm > 0 else _target_fwhm)
+    padding_deg = 5.0 * _pad_fwhm / 60.0
     padded_size_deg = cutout_size_deg + 2.0 * padding_deg
 
     if map_format == "healpix":
@@ -376,7 +595,7 @@ def smooth_cutout(
     # Compute inverse-variance weights from the RMS map (if provided).
     # w = 0 where RMS is NaN or zero so those pixels never contribute.
     if rms_proc is not None:
-        rms_proc = _sanitise(rms_proc)
+        rms_proc = _sanitise(rms_proc, remove_healpix_unseen=(map_format == "healpix"))
         w = np.where(np.isfinite(rms_proc) & (rms_proc > 0),
                      1.0 / rms_proc**2, 0.0)
     else:
@@ -385,44 +604,54 @@ def smooth_cutout(
     # ------------------------------------------------------------------
     # 3.  Smooth to the target resolution
     # ------------------------------------------------------------------
-    sigma_pix, fwhm_kernel = _compute_smoothing_kernel_sigma_pix(
-        original_res_arcmin,
-        target_res_arcmin,
-        orig_pixel_size_arcmin=current_pixel_arcmin,
-        new_pixel_size_arcmin=pixel_size_arcmin,
-        current_pixel_scale_arcmin=current_pixel_arcmin,
-    )
-
-    if sigma_pix is not None and sigma_pix > 0:
-        kernel = Gaussian2DKernel(x_stddev=sigma_pix)
+    if _input_is_gaussian:
+        # ---- Fast Gaussian path (backward compatible, exact NaN handling) ----
+        sigma_pix, _ = _compute_smoothing_kernel_sigma_pix(
+            _input_fwhm,
+            _target_fwhm,
+            orig_pixel_size_arcmin=current_pixel_arcmin,
+            new_pixel_size_arcmin=pixel_size_arcmin,
+            current_pixel_scale_arcmin=current_pixel_arcmin,
+        )
+        if sigma_pix is not None and sigma_pix > 0:
+            kernel = Gaussian2DKernel(x_stddev=sigma_pix)
+            if w is not None:
+                # Weighted Gaussian smoothing: convolve(w*data,K) / convolve(w,K)
+                valid  = np.isfinite(data_proc) & (w > 0)
+                w_data = np.where(valid, w * data_proc, 0.0)
+                w_only = np.where(valid, w, 0.0)
+                numer = convolve(w_data, kernel, boundary="fill", fill_value=0.0,
+                                 nan_treatment="fill")
+                denom = convolve(w_only, kernel, boundary="fill", fill_value=0.0,
+                                 nan_treatment="fill")
+                data_proc = np.where(denom > 0, numer / denom, np.nan)
+                w = denom   # smoothed weight map — used for weighted reprojection
+            else:
+                data_proc = convolve(
+                    data_proc, kernel,
+                    boundary="fill", fill_value=np.nan,
+                    nan_treatment="interpolate", preserve_nan=True,
+                )
+        elif w is not None:
+            w = np.where(np.isfinite(data_proc) & (w > 0), w, 0.0)
+    else:
+        # ---- Fourier-space beam transfer (non-Gaussian input_beam) ----
+        # Applies T(k) = B_target × H_in / (H_in² + ε²) in 2D Fourier space.
+        # reproject_exact (step 4) adds the output pixel window P_new,
+        # mirroring the HEALPix formula: T = (B_new × P_new)/(B_old × P_old).
+        data_proc = _apply_beam_transfer_2d(
+            data_proc, current_pixel_arcmin,
+            input_beam_eval, target_beam_eval,
+            regularization=beam_regularization,
+        )
         if w is not None:
-            # Weighted Gaussian smoothing: convolve(w*data, K) / convolve(w, K)
-            # Only count pixels that are both valid in data AND have positive weight.
-            valid = np.isfinite(data_proc) & (w > 0)
-            w_data = np.where(valid, w * data_proc, 0.0)
-            w_only = np.where(valid, w, 0.0)
-            numer = convolve(w_data, kernel, boundary="fill", fill_value=0.0,
-                             nan_treatment="fill")
-            denom = convolve(w_only, kernel, boundary="fill", fill_value=0.0,
-                             nan_treatment="fill")
-            data_proc = np.where(denom > 0, numer / denom, np.nan)
-            w = denom  # smoothed weight map — used for weighted reprojection
-        else:
-            # Standard (unweighted) smoothing
-            data_proc = convolve(
-                data_proc, kernel,
-                boundary="fill",
-                fill_value=np.nan,
-                nan_treatment="interpolate",
-                preserve_nan=True,
-            )
-    elif w is not None:
-        # No kernel needed, but mask pixels invalid in data
-        w = np.where(np.isfinite(data_proc) & (w > 0), w, 0.0)
+            # Zero out weight where the transfer produced NaN
+            w = np.where(np.isfinite(data_proc) & (w > 0), w, 0.0)
 
     # ------------------------------------------------------------------
     # 4.  Reproject to the target WCS  (exact / flux-conserving)
     # ------------------------------------------------------------------
+    footprint = None  # will be set below in both branches
     if w is not None:
         # Weighted reprojection: reproject numerator (w*data) and denominator
         # (w) separately, then divide — equivalent to inverse-variance co-adding.
@@ -433,6 +662,7 @@ def smooth_cutout(
         repr_wd, fp_wd = reproject_exact(hdu_wd, target_wcs, shape_out=target_shape)
         repr_w,  fp_w  = reproject_exact(hdu_w,  target_wcs, shape_out=target_shape)
 
+        footprint   = fp_w
         reprojected = np.where((fp_w > 0) & (repr_w > 0),
                                repr_wd / repr_w, np.nan)
     else:
@@ -577,59 +807,80 @@ def _read_fits(data, wcs, center_l, center_b, padded_size_deg):
 def _smooth_and_reproject_flat(
     noise_flat,
     flat_wcs,
-    total_sigma_pix,
+    pixel_arcmin,
+    target_beam_eval,
     target_wcs,
     target_shape,
 ):
     """
-    Apply Gaussian smoothing and exact reprojection to one flat-sky 2-D array.
+    Apply **forward** beam smoothing and exact reprojection to one MC realisation.
 
-    The ``noise_flat`` array is treated as raw white noise (i.e. it has
-    **not** yet been smoothed by any beam).  The function convolves with
-    the **total** target Gaussian kernel (beam + extra smoothing combined in
-    quadrature via ``total_sigma_pix``) and then reprojects to the output
-    WCS.  This ensures the output amplitude correctly reflects the noise
-    after the full pipeline.
+    ``noise_flat`` is raw white noise (not yet smoothed by any beam).  This
+    function applies **only** the target beam ``B_target(ℓ)`` in 2D Fourier
+    space (forward-only, no deconvolution of the input pipeline), then
+    reprojects with ``reproject_exact`` which adds the output pixel window
+    ``P_new`` implicitly.
+
+    The underlying amplitude ``sigma_WN = rms_flat / sqrt(mean(|H_in|^2))``
+    already encodes the full input pipeline (beam + pixel window).  Applying
+    only ``B_target`` here gives::
+
+        sigma_out = sigma_WN * sqrt(mean(|B_target|^2)) * p0/p1 correction
+                  = rms_flat * sqrt(mean(|B_target|^2) / mean(|H_in|^2))
+
+    which matches the exact analytical formula for any beam type.
+
+    .. note::
+
+        **Do not** use ``_apply_beam_transfer_2d`` here.  That function applies
+        a Wiener deconvolution + reconvolution (correct for DATA smoothing) but
+        would overestimate noise by dividing by ``H_in < 1``.
 
     Parameters
     ----------
     noise_flat : 2-D ndarray
-        Raw white-noise realisation on the intermediate flat-sky grid.
-        Amplitude is the underlying WN std per pixel (``sigma_WN``).
+        Raw WN realisation; amplitude = ``sigma_WN`` per pixel.  Must be
+        fully finite (no NaN).
     flat_wcs : astropy.wcs.WCS
         WCS of ``noise_flat``.
-    total_sigma_pix : float or None
-        Sigma [pixels] of the **total** Gaussian kernel to apply
-        (combining original beam and additional smoothing).  Pass ``None``
-        or ≤ 0 if no smoothing is needed.
+    pixel_arcmin : float
+        Pixel size of ``noise_flat`` [arcmin].
+    target_beam_eval : callable
+        ``B_target(ell) -> ndarray`` — desired output beam.
     target_wcs : astropy.wcs.WCS
         Output WCS.
     target_shape : tuple of int
-        Output grid shape ``(ny, nx)``.
+        Output shape ``(ny, nx)``.
 
     Returns
     -------
     out : 2-D ndarray, shape ``target_shape``
-        Smoothed and reprojected noise realisation (NaN outside footprint).
+        Beam-smoothed and reprojected noise realisation.
     """
-    proc = noise_flat.copy()
+    ny, nx = noise_flat.shape
 
-    if total_sigma_pix is not None and total_sigma_pix > 0:
-        kernel = Gaussian2DKernel(x_stddev=total_sigma_pix)
-        proc = convolve(
-            proc, kernel,
-            boundary="fill",
-            fill_value=0.0,         # WN outside the patch contributes zero
-            nan_treatment="fill",   # NaN → 0 to avoid contaminating interior
-            preserve_nan=False,
-        )
+    # 2D frequency grid (cycles / arcmin)
+    fy = np.fft.fftfreq(ny, d=pixel_arcmin)
+    fx = np.fft.fftfreq(nx, d=pixel_arcmin)
+    FX, FY = np.meshgrid(fx, fy, indexing='xy')
 
-    input_hdu = fits.PrimaryHDU(data=proc, header=flat_wcs.to_header())
+    # Multipole ℓ (flat-sky)
+    arcmin_per_rad = 180.0 * 60.0 / np.pi
+    ELL = 2.0 * np.pi * np.sqrt(FX**2 + FY**2) * arcmin_per_rad
+
+    # Apply ONLY B_target (forward smoothing — no deconvolution of H_in)
+    B_tgt = np.clip(np.asarray(target_beam_eval(ELL), dtype=float), 0.0, None)
+
+    D_fft    = np.fft.fft2(noise_flat)   # no NaN in WN realisation
+    smoothed = np.real(np.fft.ifft2(D_fft * B_tgt))
+
+    input_hdu = fits.PrimaryHDU(data=smoothed, header=flat_wcs.to_header())
     reprojected, footprint = reproject_exact(
         input_hdu, target_wcs, shape_out=target_shape,
     )
     reprojected = np.where(footprint > 0, reprojected, np.nan)
     return reprojected
+
 
 
 # ======================================================================
@@ -640,11 +891,13 @@ def propagate_rms_cutout(
     rms_data,
     map_format,
     rms_is_constant,
-    original_res_arcmin,
-    target_res_arcmin,
-    pixel_size_arcmin,
-    target_wcs,
-    target_shape,
+    original_res_arcmin=None,
+    target_res_arcmin=None,
+    input_beam=None,
+    target_beam=None,
+    pixel_size_arcmin=1.0,
+    target_wcs=None,
+    target_shape=None,
     center_l=0.0,
     center_b=0.0,
     cutout_size_deg=1.0,
@@ -652,6 +905,7 @@ def propagate_rms_cutout(
     n_mc=None,
     random_seed=None,
     healpix_coord="G",
+    beam_regularization=1e-4,
 ):
     """
     Propagate an RMS map through the smooth-and-reproject pipeline.
@@ -694,35 +948,39 @@ def propagate_rms_cutout(
     map_format : {'fits', 'healpix'}
         Format of the input RMS map (ignored when ``rms_is_constant=True``).
     rms_is_constant : bool
-        If ``True``, uses the exact analytical formula.  ``rms_data`` must
-        be a scalar.
-    original_res_arcmin : float
-        Beam FWHM of the input map [arcmin].
-    target_res_arcmin : float
-        Target beam FWHM after smoothing [arcmin].
+        If ``True``, uses the exact analytical formula (Gaussian beams only).
+        ``rms_data`` must be a scalar.
+    original_res_arcmin : float, optional
+        **Deprecated alias** for ``input_beam``.
+    target_res_arcmin : float, optional
+        **Deprecated alias** for ``target_beam``.
+    input_beam : float, tuple, or callable, optional
+        Beam profile of the input map (same format as in ``smooth_cutout``).
+    target_beam : float, optional
+        Target beam FWHM [arcmin] (always Gaussian).
     pixel_size_arcmin : float
         Output pixel size [arcmin].
     target_wcs : astropy.wcs.WCS
-        WCS of the output grid (same object used in ``smooth_cutout``).
+        WCS of the output grid.
     target_shape : tuple of int
-        Output shape ``(ny, nx)`` (same as used in ``smooth_cutout``).
+        Output shape ``(ny, nx)``.
     center_l : float
         Galactic longitude of the cutout centre [deg].
     center_b : float
         Galactic latitude of the cutout centre [deg].
     cutout_size_deg : float
-        Angular size of the *final* cutout [deg].  Used to determine the
-        minimum padded area for the MC simulations.
+        Angular size of the final cutout [deg].
     original_wcs : astropy.wcs.WCS, optional
-        WCS of the FITS input map.  Required when ``map_format='fits'``
-        and ``rms_is_constant=False``; ignored otherwise.
+        WCS of the FITS input map.
     n_mc : int
         Number of Monte Carlo realisations.  **Required** when
         ``rms_is_constant=False``.
     random_seed : int or None
-        Seed for the random number generator (for reproducibility).
+        Seed for the random number generator.
     healpix_coord : {'G', 'C', 'E'}
-        Coordinate system of the HEALPix map.  Default ``'G'`` (Galactic).
+        Coordinate system of the HEALPix map.  Default ``'G'``.
+    beam_regularization : float
+        Wiener regularisation for the Fourier beam transfer.  Default ``1e-4``.
 
     Returns
     -------
@@ -732,47 +990,67 @@ def propagate_rms_cutout(
 
     Examples
     --------
-    Constant RMS — exact formula:
+    Constant RMS — exact formula (Gaussian beam):
 
     >>> rms_out = propagate_rms_cutout(
     ...     rms_data=0.02, map_format='fits', rms_is_constant=True,
-    ...     original_res_arcmin=5.0, target_res_arcmin=10.0,
+    ...     input_beam=5.0, target_beam=10.0,
     ...     pixel_size_arcmin=2.0, target_wcs=wcs, target_shape=(60, 60),
     ... )
 
-    Spatially varying FITS RMS — Monte Carlo with 300 realisations:
+    Spatially varying FITS RMS — Monte Carlo with custom beam:
 
     >>> rms_out = propagate_rms_cutout(
     ...     rms_data=rms_map, map_format='fits', rms_is_constant=False,
     ...     original_wcs=fits_wcs,
     ...     center_l=17.0, center_b=0.8, cutout_size_deg=2.0,
-    ...     original_res_arcmin=5.0, target_res_arcmin=10.0,
+    ...     input_beam=(ell_arr, B_ell_arr), target_beam=10.0,
     ...     pixel_size_arcmin=2.0, target_wcs=wcs, target_shape=(60, 60),
     ...     n_mc=300, random_seed=42,
     ... )
     """
     # ------------------------------------------------------------------
-    # CASE 1 — Constant RMS: exact analytical formula
+    # Resolve beam specifications (backward compatibility)
+    # ------------------------------------------------------------------
+    if input_beam is None and original_res_arcmin is not None:
+        input_beam = float(original_res_arcmin)
+    if target_beam is None and target_res_arcmin is not None:
+        target_beam = float(target_res_arcmin)
+    if input_beam is None:
+        raise ValueError("Provide input_beam (or the deprecated original_res_arcmin).")
+    if target_beam is None:
+        raise ValueError("Provide target_beam (or the deprecated target_res_arcmin).")
+
+    _input_is_gaussian = isinstance(input_beam, (int, float))
+    input_beam_eval    = _make_beam_evaluator(input_beam)
+    target_beam_eval   = _make_beam_evaluator(target_beam)
+    _input_fwhm        = float(input_beam) if _input_is_gaussian else _beam_effective_fwhm(input_beam_eval)
+    _target_fwhm       = float(target_beam)
+
+    # ------------------------------------------------------------------
+    # CASE 1 — Constant RMS: exact analytical formula (Gaussian beams only)
     # ------------------------------------------------------------------
     if rms_is_constant:
         sigma_in = float(rms_data)
 
-        # We need the original pixel scale.  For a constant-RMS map we
-        # cannot read it from a WCS, so we derive it from the intermediate
-        # grid that _read_healpix / _read_fits would produce.  As a robust
-        # proxy, we use the output pixel size as the reference scale.
-        # The formula only needs p₀; we obtain it from original_wcs (FITS)
-        # or from a dummy HEALPix nside estimate.
+        if not _input_is_gaussian:
+            warnings.warn(
+                "propagate_rms_cutout: rms_is_constant=True uses the exact "
+                "Gaussian analytical formula.  For a non-Gaussian input_beam "
+                "the effective FWHM is used as an approximation.  Use "
+                "rms_is_constant=False with n_mc for a rigorous Monte Carlo.",
+                stacklevel=2,
+            )
+
+        # Derive the original pixel scale from the WCS when available.
         if map_format == "fits" and original_wcs is not None:
             pixel_scales_deg = proj_plane_pixel_scales(original_wcs)
-            p0 = float(np.mean(pixel_scales_deg)) * 60.0        # arcmin
+            p0 = float(np.mean(pixel_scales_deg)) * 60.0   # arcmin
         elif map_format == "healpix":
-            # Cannot determine p0 without data; warn and use pixel_size_arcmin
             warnings.warn(
                 "propagate_rms_cutout: for HEALPix + rms_is_constant=True, "
                 "the original pixel scale cannot be inferred without data.  "
-                "Pass original_wcs=None and provide a FITS WCS, or use "
-                "rms_is_constant=False with Monte Carlo instead.",
+                "Use rms_is_constant=False with Monte Carlo instead.",
                 stacklevel=2,
             )
             p0 = pixel_size_arcmin
@@ -781,11 +1059,11 @@ def propagate_rms_cutout(
 
         p1 = pixel_size_arcmin
 
-        # Effective resolutions including pixel window functions
-        pw_orig = _pixel_window_fwhm(p0)
-        pw_new  = _pixel_window_fwhm(p1)
-        theta_eff_orig   = np.sqrt(original_res_arcmin**2   + pw_orig**2)
-        theta_eff_target = np.sqrt(target_res_arcmin**2     + pw_new**2)
+        # σ_out = σ_in × (p₀/p₁) × (θ_eff_orig / θ_eff_target)
+        pw_orig          = _pixel_window_fwhm(p0)
+        pw_new           = _pixel_window_fwhm(p1)
+        theta_eff_orig   = np.sqrt(_input_fwhm**2  + pw_orig**2)
+        theta_eff_target = np.sqrt(_target_fwhm**2 + pw_new**2)
 
         sigma_out = sigma_in * (p0 / p1) * (theta_eff_orig / theta_eff_target)
         return np.full(target_shape, sigma_out, dtype=float)
@@ -801,7 +1079,8 @@ def propagate_rms_cutout(
     rng = np.random.default_rng(random_seed)
 
     # Padding around the cutout to avoid edge effects (same as smooth_cutout)
-    padding_deg = 5.0 * target_res_arcmin / 60.0
+    _pad_fwhm       = max(_target_fwhm, _input_fwhm if _input_fwhm > 0 else _target_fwhm)
+    padding_deg     = 5.0 * _pad_fwhm / 60.0
     padded_size_deg = cutout_size_deg + 2.0 * padding_deg
 
     # ------------------------------------------------------------------
@@ -834,66 +1113,54 @@ def propagate_rms_cutout(
     rms_flat = np.where(np.isfinite(rms_flat) & (rms_flat > 0), rms_flat, 0.0)
 
     # ------------------------------------------------------------------
-    # Step 2 — Compute kernels needed for the Monte Carlo
+    # Step 2 — Compute sigma_WN from the input beam power on the 2D grid
     # ------------------------------------------------------------------
-    # The input RMS map (rms_flat) is the noise of a beam-smoothed map.
-    # The underlying white-noise per pixel is:
-    #     sigma_WN = rms_flat / sqrt(sum(K_b^2))
-    # where K_b is the Gaussian kernel of the original beam.
-    # Each MC realisation draws from WN with that amplitude, then convolves
-    # with the TOTAL kernel K_total = Gaussian(sigma_b ⊕ sigma_extra) and
-    # reprojects.  This is equivalent to simulating the full pipeline from
-    # scratch on raw WN, which correctly propagates correlated noise.
+    # The input RMS map (rms_flat) is the noise of the beam-smoothed map.
+    # The underlying white noise per pixel is:
+    #
+    #     sigma_WN = rms_flat / sqrt(mean(|H_in(k)|²))
+    #
+    # where H_in(k) = B_input(ℓ) × P_pixel_orig(k) is the combined transfer
+    # of the input beam and the intermediate pixel window, evaluated on the
+    # 2D Fourier grid of the flat patch.  This generalises the Gaussian case
+    # and is equivalent to the user's suggestion of simulating WN and
+    # applying T = (B_new/B_old) × (P_new/P_old) in Fourier space.
+    ny_flat, nx_flat = rms_flat.shape
+    fy_grid = np.fft.fftfreq(ny_flat, d=flat_pixel_arcmin)
+    fx_grid = np.fft.fftfreq(nx_flat, d=flat_pixel_arcmin)
+    FX_g, FY_g = np.meshgrid(fx_grid, fy_grid, indexing='xy')
 
-    fwhm_to_sigma = _FWHM_TO_SIGMA  # 1 / (2*sqrt(2*ln2)) ≈ 0.4247
+    arcmin_per_rad = 180.0 * 60.0 / np.pi
+    ELL_g  = 2.0 * np.pi * np.sqrt(FX_g**2 + FY_g**2) * arcmin_per_rad
+    B_in_g = np.clip(np.asarray(input_beam_eval(ELL_g), dtype=float), 0.0, None)
+    P_or_g = np.sinc(FX_g * flat_pixel_arcmin) * np.sinc(FY_g * flat_pixel_arcmin)
+    H_in_g = B_in_g * P_or_g
 
-    # Original beam sigma [pixels on the flat intermediate grid]
-    sigma_b_arcmin = original_res_arcmin * fwhm_to_sigma
-    sigma_b_pix    = sigma_b_arcmin / flat_pixel_arcmin
+    # Parseval: sum(K_b²) ≡ mean(|H_in|²)  in the discrete Fourier sense
+    sum_Kb_sq = float(np.mean(H_in_g**2))
+    if sum_Kb_sq <= 0:
+        sum_Kb_sq = 1.0   # fallback: no beam → sigma_WN = rms_flat
 
-    # Extra smoothing kernel sigma [pixels] — needed to reach target resolution
-    sigma_k_pix, _ = _compute_smoothing_kernel_sigma_pix(
-        original_res_arcmin,
-        target_res_arcmin,
-        orig_pixel_size_arcmin=flat_pixel_arcmin,
-        new_pixel_size_arcmin=pixel_size_arcmin,
-        current_pixel_scale_arcmin=flat_pixel_arcmin,
-    )
-
-    # Total kernel: combine beam and extra kernel in quadrature
-    if sigma_k_pix is not None and sigma_k_pix > 0:
-        sigma_total_pix = np.sqrt(sigma_b_pix**2 + sigma_k_pix**2)
-    else:
-        sigma_total_pix = sigma_b_pix  # no additional smoothing needed
-
-    # Amplitude correction: convert rms_flat (noise of beam-smoothed map)
-    # to sigma_WN (noise of the underlying raw WN field).
-    # For a Gaussian kernel: sum(K^2) = 1 / (4*pi*sigma_pix^2)  [continuous limit]
-    # Using the actual discrete kernel avoids small numerical errors.
-    if sigma_b_pix > 0:
-        K_b = Gaussian2DKernel(x_stddev=sigma_b_pix)
-        sum_Kb_sq = np.sum(K_b.array ** 2)
-    else:
-        sum_Kb_sq = 1.0   # no beam → sigma_WN = rms_flat
-
-    # sigma_WN per pixel (spatially varying field)
     sigma_WN_flat = rms_flat / np.sqrt(sum_Kb_sq)
 
     # ------------------------------------------------------------------
     # Step 3 — Monte Carlo: generate WN realisations and propagate
     # ------------------------------------------------------------------
-    ny_flat, nx_flat = rms_flat.shape
     out_stack = np.empty((n_mc, *target_shape), dtype=float)
 
     for k in range(n_mc):
-        # Draw raw white noise scaled by sigma_WN per pixel
+        # Draw raw white noise at the native amplitude
         noise_k = rng.standard_normal((ny_flat, nx_flat)) * sigma_WN_flat
 
-        # Apply total kernel (beam + extra) and reproject to target WCS
+        # Apply ONLY the target beam B_tgt in Fourier space (forward smoothing).
+        # reproject_exact adds the output pixel window P_new implicitly.
+        # sigma_WN already encodes the full input pipeline, so no deconvolution
+        # is needed here — that would overestimate noise (divides by H_in < 1).
         out_stack[k] = _smooth_and_reproject_flat(
             noise_k,
             flat_wcs,
-            sigma_total_pix,
+            flat_pixel_arcmin,
+            target_beam_eval,
             target_wcs,
             target_shape,
         )

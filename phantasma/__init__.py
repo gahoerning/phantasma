@@ -21,7 +21,13 @@ Usage
     result.summary()
 """
 
-from .cutoff_processing import smooth_cutout, make_target_wcs, propagate_rms_cutout
+from .cutoff_processing import (
+    smooth_cutout,
+    make_target_wcs,
+    propagate_rms_cutout,
+    _make_beam_evaluator as make_beam_evaluator,
+    _beam_effective_fwhm as beam_effective_fwhm,
+)
 from .template_fitting import (
     TemplateFitResult,
     make_geometric_templates,
@@ -35,6 +41,8 @@ __all__ = [
     "smooth_cutout",
     "make_target_wcs",
     "propagate_rms_cutout",
+    "make_beam_evaluator",
+    "beam_effective_fwhm",
     # template_fitting
     "TemplateFitResult",
     "make_geometric_templates",

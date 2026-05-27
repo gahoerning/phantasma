@@ -2,10 +2,28 @@
 
 **P**latform of **H**igh-level **A**nalysis, **N**umerical **T**echniques **a**nd **S**ky **M**ap **A**pplications
 
-PHANTaSMA is a precision-oriented framework for astrophysical sky-map analysis.  
-Its purpose is to integrate established libraries (`healpy`, `astropy`, `numpy`, `scipy`) into rigorously controlled pipelines that minimise numerical inconsistencies and preprocessing biases.
+PHANTaSMA is a precision-oriented framework for astronomical sky-map preprocessing, analysis, and linear template fitting. Its core goal is to integrate established astrophysics and astronomy libraries (`healpy`, `astropy`, `numpy`, `scipy`, `reproject`) into rigorously controlled, mathematically exact pipelines that minimize numerical inconsistencies, coordinate reprojection issues, and preprocessing biases.
 
-The project does not aim to replace existing libraries. It enforces correct usage patterns, explicit assumptions, and reproducible workflows.
+The framework is built around **exact physical principles** (e.g., pixel window correction, Wiener-regularized beam transfers, flux conservation) and **robust uncertainty propagation** (Monte Carlo noise projection and Bootstrap template fitting).
+
+---
+
+## Key Features
+
+- 🌌 **Unified Preprocessing (`cutoff_processing`)**: Reproject, smooth, and extract cutouts from both FITS flat-sky maps (data + WCS) and HEALPix full-sky maps in a single, clean function call.
+- 📐 **Non-Gaussian / Arbitrary Beam Support**: Smooth maps using either Gaussian beams (FWHM) or arbitrary tabulated beam profiles (e.g., $B(\ell)$ tables from survey websites like Planck or COMAP), or custom mathematical callables.
+- 🧮 **Fourier-Space Transfer Functions**: Implements Wiener-regularized 2D FFT transfer functions:
+  $$T(\ell) = \frac{B_{\text{target}}(\ell) P_{\text{new}}(\ell)}{B_{\text{input}}(\ell) P_{\text{old}}(\ell)}$$
+  which exactly mirrors spherical harmonic operations on flat-sky projection patches.
+- 📉 **Rigorous Noise/RMS Propagation (`propagate_rms_cutout`)**:
+  - **Constant RMS**: Fast, exact analytical propagation formula including pixel window functions:
+    $$\sigma_{\text{out}} = \sigma_{\text{in}} \cdot \left(\frac{p_0}{p_1}\right) \cdot \left(\frac{\theta_{\text{eff, orig}}}{\theta_{\text{eff, target}}}\right)$$
+  - **Spatially-Varying RMS**: Memory-efficient Monte Carlo simulation patch propagation (HEALPix and FITS). Simulates white noise *only* on the local cutout patch, preventing memory bloat on large HEALPix maps.
+- ⚖️ **Weighted Linear Template Fitting (`template_fitting`)**:
+  - Stable SVD-based multi-template linear solver.
+  - Accounts for geometric foregrounds (monopoles, x/y linear gradients, quadratic gradients).
+  - Iterative pixel-variance updates incorporating template noise and calibration uncertainties.
+  - Bootstrap-based parameter uncertainty estimation with a clean progress bar.
 
 ---
 
@@ -19,114 +37,221 @@ Dependencies (`numpy`, `astropy`, `scipy`, `healpy`, `reproject`, `tqdm`) are in
 
 ---
 
-## Modules
+## Modules & Usage Guide
 
-### `phantasma.cutoff_processing` — Map preprocessing
+### 1. `phantasma.cutoff_processing` — Precision Map Preprocessing
 
-Reprojection, smoothing, and cutout utilities for 2-D sky maps.
+This module provides tools to smooth, reproject, and crop astronomical maps to a target grid defined by an `astropy.wcs.WCS` object.
+
+#### Basic Usage (Gaussian Beams)
 
 ```python
-from phantasma import smooth_cutout, make_target_wcs
+import phantasma as ph
 
-target_wcs = make_target_wcs(...)
-result = smooth_cutout(...)
+# Create target WCS centered at (l, b) = (17.0, 0.8) with 2.0 arcmin pixel size and 2x2 deg field of view
+target_wcs, target_shape = ph.make_target_wcs(
+    center_l=17.0,
+    center_b=0.8,
+    pixel_size_arcmin=2.0,
+    cutout_size_deg=2.0
+)
+
+# Smooth and reproject a flat-sky FITS map
+data_out, wcs_out = ph.smooth_cutout(
+    data=fits_data,
+    map_format="fits",
+    original_wcs=fits_wcs,
+    input_beam=5.0,        # original beam FWHM in arcmin
+    target_beam=10.0,      # desired target resolution FWHM in arcmin
+    pixel_size_arcmin=2.0,
+    target_wcs=target_wcs,
+    target_shape=target_shape
+)
+```
+
+#### Advanced: Tabulated/Non-Gaussian Beams $B(\ell)$
+
+If you are using a survey with a measured non-Gaussian beam, you can pass the tabulated beam transfer function directly:
+
+```python
+import numpy as np
+import phantasma as ph
+
+# Load measured beam profile from a survey (e.g. Planck, Effelsberg, COMAP)
+# B_ell is the beam transfer function normalized to 1 at ell=0
+ell, B_ell = np.loadtxt("survey_beam_profile.txt", unpack=True)
+
+data_out, wcs_out = ph.smooth_cutout(
+    data=hpx_map,
+    map_format="healpix",
+    healpix_coord="G",
+    center_l=17.0,
+    center_b=0.8,
+    cutout_size_deg=2.0,
+    input_beam=(ell, B_ell),  # Non-Gaussian input beam specification!
+    target_beam=10.0,         # Target beam FWHM (always Gaussian)
+    pixel_size_arcmin=2.0,
+    target_wcs=target_wcs,
+    target_shape=target_shape,
+    beam_regularization=1e-4  # Wiener regularization parameter
+)
+```
+
+#### Inverse-Variance Weighted Preprocessing
+
+When a noise/RMS map is provided, `smooth_cutout` performs **inverse-variance weighted smoothing** and **weighted reprojection**, ensuring high-noise pixels (or masked regions) do not bias the output:
+
+```python
+data_out, wcs_out = ph.smooth_cutout(
+    data=fits_data,
+    rms_data=rms_data,       # Provide the original RMS map
+    map_format="fits",
+    original_wcs=fits_wcs,
+    input_beam=5.0,
+    target_beam=10.0,
+    pixel_size_arcmin=2.0,
+    target_wcs=target_wcs,
+    target_shape=target_shape
+)
+```
+
+#### Precision RMS Propagation (`propagate_rms_cutout`)
+
+Propagates the associated RMS/noise maps through the exact same smoothing and reprojection pipelines.
+
+##### Case A: Spatially Constant RMS (Exact Analytical Formula)
+```python
+# Propagates a single constant RMS noise level using exact analytical formula
+rms_out = ph.propagate_rms_cutout(
+    rms_data=0.02,           # Constant noise standard deviation
+    rms_is_constant=True,
+    map_format="fits",
+    input_beam=5.0,
+    target_beam=10.0,
+    pixel_size_arcmin=2.0,
+    target_wcs=target_wcs,
+    target_shape=target_shape
+)
+```
+
+##### Case B: Spatially Varying RMS (Memory-Efficient Monte Carlo)
+For varying FITS or HEALPix RMS maps, a Monte Carlo simulation runs *only* on the extracted padded cutout grid. This keeps memory usage extremely low.
+```python
+# Spatially-varying RMS propagation via Wiener-correct local MC realisations
+rms_out = ph.propagate_rms_cutout(
+    rms_data=rms_map,        # 1-D HEALPix array or 2-D FITS array
+    rms_is_constant=False,
+    map_format="healpix",
+    center_l=17.0,
+    center_b=0.8,
+    cutout_size_deg=2.0,
+    input_beam=(ell, B_ell),
+    target_beam=10.0,
+    pixel_size_arcmin=2.0,
+    target_wcs=target_wcs,
+    target_shape=target_shape,
+    n_mc=300,                # Number of MC simulation realisations
+    random_seed=42
+)
 ```
 
 ---
 
-### `phantasma.template_fitting` — Weighted linear template fitting
+### 2. `phantasma.template_fitting` — Multi-Template Linear Regression
 
-Fits the model:
+Fits multi-component astrophysical models with optional spatial gradients and full parameter covariance:
 
-```
-data_map = Σ_i  a_i · template_i  +  Σ_j  b_j · geom_j  +  residual
-```
+$$\text{data\_map} = \sum_{i} a_i \cdot \text{template}_i + \sum_{j} b_j \cdot \text{geom}_j + \text{residual}$$
 
-Features:
-- **Iterative uncertainty propagation** — total pixel variance is updated at each iteration to account for calibration errors and template noise.
-- **SVD-based solver** (`scipy`) for numerical stability with ill-conditioned design matrices.
-- **Bootstrap uncertainty estimation** — pixel resampling with a `tqdm` progress bar.
-- **Geometric foreground templates** — monopole, x/y gradients, quadratic r².
-- **`template_fit`** — fast version without bootstrap, for exploratory fits.
-
-#### Quick start
+#### Setup and Fitting (Quickstart)
 
 ```python
-from phantasma.template_fitting import template_fit_bootstrap
+from phantasma.template_fitting import template_fit_bootstrap, make_geometric_templates
 
+# 1. Create geometric baseline templates (monopole + linear gradients)
+geom_templates, geom_names = make_geometric_templates(
+    shape=data_map.shape, 
+    include=("monopole", "x", "y")
+)
+
+# 2. Run the iterative fitting + bootstrap analysis
 result = template_fit_bootstrap(
-    data_map,
-    template_maps,          # shape (Ntemp, ny, nx)
+    data_map=data_map,
+    template_maps=template_maps,                  # shape: (N_templates, ny, nx)
     data_rms=rms_map,
-    template_names=["dust", "co"],
+    template_rms=template_rms_maps,               # noise in the templates themselves
+    data_calib_frac=0.05,                         # 5% calibration uncertainty on data
+    template_calib_frac=[0.10, 0.05],             # calibration uncertainty per template
+    geom_templates=geom_templates,
+    geom_names=geom_names,
+    template_names=["Eff. 2.7 GHz", "IRIS 25um"],
     n_bootstrap=1000,
+    random_seed=42
 )
 
-result.summary()
-# ======================================================================
-# Template Fit Summary
-# ======================================================================
-# Parameter                   Value      Formal σ   Bootstrap σ
-# ----------------------------------------------------------------------
-# dust                       1.4991    0.00075491     0.0007952
-# co                         3.0002    0.00074608    0.00074665
-# ...
-
-# Per-template contribution maps
-contrib = result.component_maps(template_maps)   # shape (Ntemp, ny, nx)
-```
-
-#### Geometric foreground removal
-
-```python
-from phantasma.template_fitting import make_geometric_templates, template_fit_bootstrap
-
-geom, gnames = make_geometric_templates(data_map.shape, include=("monopole", "x", "y"))
-
-result = template_fit_bootstrap(
-    data_map, template_maps, data_rms=rms_map,
-    geom_templates=geom, geom_names=gnames,
-)
-```
-
-#### Synthetic simulation (for validation)
-
-```python
-from phantasma.template_fitting import simulate_template_fit, template_fit_bootstrap
-
-data, templates, rms, true_a = simulate_template_fit(
-    shape=(64, 64),
-    true_amplitudes=[1.5, 3.0],
-    noise_level=0.05,
-)
-
-result = template_fit_bootstrap(data, templates, data_rms=rms)
+# 3. Print a comprehensive statistics report
 result.summary()
 ```
 
+Sample output:
+```
+======================================================================
+Template Fit Summary
+======================================================================
+Parameter                   Value      Formal σ   Bootstrap σ
+----------------------------------------------------------------------
+Eff. 2.7 GHz               1.4991    0.00075491     0.0007952
+IRIS 25um                  3.0002    0.00074608    0.00074665
+monopole                  -0.0520    0.01240500     0.0135021
+x                          0.0031    0.00140200     0.0015112
+y                         -0.0084    0.00135200     0.0014021
+======================================================================
+Reduced Chi-Square: 1.042
+```
+
+#### Extract Component and Residual Maps
+
+```python
+# Compute individual foreground contribution maps
+contrib_maps = result.component_maps(template_maps) # shape: (N_templates, ny, nx)
+
+# Extract fitted amplitudes directly
+amplitudes = result.amplitudes
+errors = result.bootstrap_errors
+```
+
 ---
 
-## Planned Features
+## Core Mathematical Principles
 
-- RMS map smoothing (HEALPix and Cartesian)
-- Safe HEALPix resolution changes (`ud_grade` with variance and pixel window control)
-- Simple SED fitting (synchrotron, dust, free–free)
-- Gaussian fitting via MCMC
-- Aperture photometry utilities
-- High-performance C/C++ modules for heavy simulations
-
----
-
-## Principles
-
-- Numerical exactness
-- Explicit beam and resolution handling
-- Reproducibility
-- Modular design
+1. **Pixel Window Conservation**:
+   We model pixels as square top-hat filters. When smoothing from beam $\theta_A$ on grid $p_0$ to target beam $\theta_B$ on grid $p_1$, the required smoothing kernel FWHM $\theta_K$ is:
+   $$\theta_K^2 = \theta_B^2 - \theta_A^2 - \theta_{\text{pix}, 0}^2 - \theta_{\text{pix}, 1}^2$$
+   where $\theta_{\text{pix}} \approx 0.6798 \cdot p$ is the FWHM of the pixel's Gaussian approximation.
+2. **Wiener-Deconvolution**:
+   When using tabulated beams, we reconstruct the Fourier-space signal before applying the target beam to avoid multi-pixel leakage, regularised by parameter $\epsilon$:
+   $$T(\ell) = \frac{B_{\text{target}}(\ell) P_{\text{new}}(\ell)}{B_{\text{input}}(\ell) P_{\text{old}}(\ell) + \epsilon}$$
+3. **Rigorous Calibration & Noise Iteration**:
+   In linear fits, templates themselves carry noise and calibration scaling errors. We solve this by iteratively updating the weights matrix using the fitted amplitudes:
+   $$\sigma^2_{k} = \sigma^2_{\text{data}, k} + (\alpha_{\text{data}} d_k)^2 + \sum_{i} a_i^2 \sigma^2_{\text{temp}, i, k} + \sum_{i} (a_i \alpha_{\text{temp}, i} t_{i, k})^2$$
 
 ---
 
-## Status
+## Status & Roadmap
 
-Active development. Implemented modules: `cutoff_processing`, `template_fitting`.
+PHANTaSMA is in active scientific deployment.
 
+- [x] Cartesian/FITS and HEALPix support for reprojection, cutout, and exact smoothing.
+- [x] Complete support for arbitrary/tabulated non-Gaussian beam profiles $B(\ell)$.
+- [x] Exact analytical & Monte Carlo local patch RMS propagation.
+- [x] Iterative, weighted SVD template fitting with bootstrap statistics.
+- [ ] Simple SED fitting (synchrotron, dust, free–free)
+- [ ] MCMC-based high-dimensional parameter estimation.
+- [ ] Aperture photometry suite.
+- [ ] C++ accelerations for huge-scale Monte Carlo noise realisations.
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](file:///Users/user/code/phantasma/LICENSE) file for details.
